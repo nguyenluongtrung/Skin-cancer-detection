@@ -2,11 +2,11 @@
 
 ## Project Structure & Module Organization
 
-`src/prepare_data.py` discovers HAM10000 metadata and JPEGs, audits records, and creates or verifies fixed lesion-grouped splits. `src/data_pipeline.py` handles RGB decoding, resizing, model-specific preprocessing, dataset construction, and the Day 1 smoke check. Shared seed and JSON helpers live in `src/utils.py`; plotting lives in `src/visualization.py`. `notebooks/01_eda.ipynb` imports these modules for exploration. `day1_ham10000.py` is the retained original fallback. Generated files go in `day1_artifacts/`, which Git ignores. The README describes later work, but experiment modules do not exist yet.
+`src/prepare_data.py` discovers HAM10000 metadata and JPEGs, audits records, and creates or verifies fixed lesion-grouped splits. `src/data_pipeline.py` handles RGB decoding, resizing, model-specific preprocessing, dataset construction, and the Day 1 smoke check. Shared seed and JSON helpers live in `src/utils.py`; plotting lives in `src/visualization.py`. `notebooks/01_eda.ipynb` imports these modules for exploration. `scripts/download_ham10000_isic.py` downloads the official ISIC release and builds the required metadata CSV. Generated data and artifacts are ignored by Git. The README describes later work, but experiment modules do not exist yet.
 
 ## Build, Test, and Development Commands
 
-Install dependencies with `python -m pip install -r requirements.txt`. From the repository root, run `python -m src.prepare_data --input-root data --output-dir day1_artifacts` to audit and split the dataset. Then run `python -m src.data_pipeline --output-dir day1_artifacts --batch-size 32` for the one-batch save/reload check. On Kaggle, set `--input-root /kaggle/input` and output under `/kaggle/working/`. Run synthetic checks with `python -m unittest discover -s tests -v`. There is no build step.
+Install dependencies with `python -m pip install -r requirements.txt`. If needed, run `python -m scripts.download_ham10000_isic --output-dir data`; this downloads about 2.58 GiB and records provenance. Then run `python -m src.prepare_data --input-root data --output-dir day1_artifacts` to audit and split, followed by `python -m src.data_pipeline --output-dir day1_artifacts --batch-size 32` for the one-batch save/reload check. On Kaggle, set `--input-root /kaggle/input` and output under `/kaggle/working/`. Run synthetic checks with `python -m unittest discover -s tests -v`. There is no build step.
 
 ## Coding Style & Naming Conventions
 

@@ -17,6 +17,8 @@ An ML/DL assignment investigating how pretrained architectures, data augmentatio
 
 Dataset: https://www.kaggle.com/datasets/kmader/skin-cancer-mnist-HAM10000/data
 
+The repository also provides a resumable downloader for the [official ISIC 2018 Task 3 training release](https://challenge.isic-archive.com/data/). It supplies the 10,015 HAM10000 training JPEGs, lesion groupings, and diagnosis ground truth. `scripts/download_ham10000_isic.py` joins the official grouping and one-hot diagnosis files into `data/HAM10000_metadata.csv`. This derived CSV has the required `image_id`, `lesion_id`, and `dx` columns; it is not a byte-for-byte copy of Kaggle's metadata CSV. Source URLs and attribution are recorded in `data/SOURCE.txt` after download.
+
 The dataset contains 10,015 dermatoscopic images across seven diagnostic categories. These include both benign and malignant lesions.
 
 | Code    | Diagnostic category                             |
@@ -31,8 +33,8 @@ The dataset contains 10,015 dermatoscopic images across seven diagnostic categor
 
 The project uses:
 
-- Original JPEG images from both image folders.
-- `HAM10000_metadata.csv`.
+- Original RGB JPEG images from both Kaggle image folders, or the equivalent official ISIC training archive (one image folder).
+- `HAM10000_metadata.csv` from Kaggle or the derived three-column-compatible ISIC CSV.
 - `dx` as the classification target.
 - `lesion_id` for grouped splitting.
 - `image_id` for image identification.
@@ -81,8 +83,8 @@ Record the actual Python, framework, and hardware versions used for experiments.
 | `src/data_pipeline.py` | Decode and resize RGB images; apply model-specific preprocessing; construct datasets; run the Day 1 batch and checkpoint smoke check |
 | `src/visualization.py` | Reusable class, image, and batch figures |
 | `src/utils.py` | Seed, runtime information, and JSON serialization |
+| `scripts/download_ham10000_isic.py` | Resumable official-data download and metadata conversion |
 | `notebooks/01_eda.ipynb` | Interactive Day 1 exploration using functions from `src/` |
-| `day1_ham10000.py` | Original all-in-one fallback, retained until the new entry points are checked in the dataset runtime |
 | `day1_artifacts/` | Generated audit, plots, fixed splits, class mapping, and smoke checkpoint; ignored by Git |
 | `requirements.txt`, `.gitignore` | Dependencies and local artifact exclusions |
 
@@ -121,6 +123,12 @@ GPU support depends on the operating system and installed framework build. Confi
 Alternatively, use a Kaggle notebook with the dataset attached. Day 1 works on CPU. Keep the repository under `/kaggle/working/` so `src/` is importable and outputs are writable.
 
 ### 2. Run Day 1 preparation
+
+If Kaggle download is unavailable, download the official ISIC release first. The archive is about 2.58 GiB; the script resumes interrupted downloads and verifies all 10,015 JPEGs:
+
+```bash
+python -m scripts.download_ham10000_isic --output-dir data
+```
 
 From the repository root, with an extracted local dataset:
 
