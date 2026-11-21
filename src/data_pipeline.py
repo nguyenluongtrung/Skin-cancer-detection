@@ -22,6 +22,41 @@ IMAGE_SIZE = (224, 224)
 NUM_CLASSES = 7
 
 
+def load_training_partitions(splits_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
+    """Load only saved train/validation rows and class indices; never open test.csv."""
+    splits_dir = Path(splits_dir).expanduser().resolve()
+    mapping = json.loads((splits_dir / "class_mapping.json").read_text(encoding="utf-8"))
+    if sorted(mapping.values()) != list(range(NUM_CLASSES)) or len(mapping) != NUM_CLASSES:
+        raise ValueError("Saved class mapping must contain seven consecutive integer indices.")
+    frames = []
+    for name in ("train", "validation"):
+        frame = pd.read_csv(
+            splits_dir / f"{name}.csv",
+            dtype={"image_id": str, "lesion_id": str, "dx": str, "image_path": str},
+        )
+        required = {"image_id", "lesion_id", "dx", "image_path", "class_index"}
+        if not required.issubset(frame.columns) or frame.empty:
+            raise ValueError(f"Saved {name}.csv is empty or lacks {sorted(required - set(frame.columns))}.")
+        if frame[list(required)].isna().any().any():
+            raise ValueError(f"Saved {name}.csv contains missing required values.")
+        if not frame["class_index"].astype(int).eq(frame["dx"].map(mapping)).all():
+            raise ValueError(f"Saved {name}.csv class indices differ from class_mapping.json.")
+        if set(frame["dx"]) != set(mapping):
+            raise ValueError(f"Saved {name}.csv must contain every mapped diagnosis.")
+        if frame["image_id"].duplicated().any():
+            raise ValueError(f"Duplicate image IDs in {name}.csv.")
+        frames.append(frame)
+    train, validation = frames
+    if not set(train["lesion_id"]).isdisjoint(validation["lesion_id"]):
+        raise ValueError("Train and validation splits share lesion IDs.")
+    if not set(train["image_id"]).isdisjoint(validation["image_id"]):
+        raise ValueError("Train and validation splits share image IDs.")
+    for frame in frames:
+        if not Path(frame.iloc[0]["image_path"]).is_file():
+            raise FileNotFoundError(f"Saved image path is missing: {frame.iloc[0]['image_path']}")
+    return train, validation, mapping
+
+
 def decode_resize(path: tf.Tensor, label: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
     """Decode original RGB JPEG to float32 pixels in [0, 255]."""
     image = tf.io.decode_jpeg(tf.io.read_file(path), channels=3)
@@ -64,6 +99,10 @@ def make_image_dataset(
     if architecture is not None:
         preprocess = preprocess_for(architecture)
         dataset = dataset.map(lambda image, label: (preprocess(image), label), num_parallel_calls=tf.data.AUTOTUNE)
+    if not training:
+        options = tf.data.Options()
+        options.deterministic = True
+        dataset = dataset.with_options(options)
     return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 

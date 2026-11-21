@@ -81,11 +81,16 @@ Record the actual Python, framework, and hardware versions used for experiments.
 | --- | --- |
 | `src/prepare_data.py` | Discover metadata and JPEGs; audit, create, reuse, and verify lesion-grouped splits |
 | `src/data_pipeline.py` | Decode and resize RGB images; apply model-specific preprocessing; construct datasets; run the Day 1 batch and checkpoint smoke check |
+| `src/models.py` | Frozen ImageNet backbones with the shared seven-class head |
+| `src/train.py` | Day 2 callbacks, checkpoint selection, training entry point, and experiment log |
+| `src/evaluate.py` | Validation predictions and classification metrics |
 | `src/visualization.py` | Reusable class, image, and batch figures |
 | `src/utils.py` | Seed, runtime information, and JSON serialization |
 | `scripts/download_ham10000_isic.py` | Resumable official-data download and metadata conversion |
 | `notebooks/01_eda.ipynb` | Interactive Day 1 exploration using functions from `src/` |
+| `configs/day2_frozen_no_aug.json` | Shared Day 2 settings for all three architectures |
 | `day1_artifacts/` | Generated audit, plots, fixed splits, class mapping, and smoke checkpoint; ignored by Git |
+| `outputs/` | Run-specific Day 2 artifacts and `experiment_log.csv`; ignored by Git |
 | `requirements.txt`, `.gitignore` | Dependencies and local artifact exclusions |
 
 Later experiment modules and outputs will be added by responsibility when their stages begin. They are not implemented yet.
@@ -157,6 +162,30 @@ For Kaggle, use `--output-dir /kaggle/working/day1_artifacts`. Use `--batch-size
 Inspect `audit_summary.json`, `audit_issues.csv`, `split_counts.csv`, `split_manifest.json`, `class_mapping.json`, `environment.json`, and `smoke_result.json` before Day 2. Save the entire `day1_artifacts/` folder so later experiments use the same partitions. If the dataset moves, rerun preparation: it verifies existing split membership and refreshes image paths without changing partition assignments.
 
 Run the small synthetic checks with `python -m unittest discover -s tests -v`. They check split overlap detection, raw image order and range, finite one-batch loss, and checkpoint reload. They do not replace the audit of the real HAM10000 files.
+
+### 4. Run Day 2 frozen baselines
+
+Use an activated PowerShell virtual environment from `C:\Users\OS\OneDrive\Desktop\Skin cancer detection`. The following tiny check uses the saved train/validation rows, random backbone weights, and one batch. It verifies preprocessing, frozen weights, callback order, and checkpoint reload without starting an experiment:
+
+```powershell
+python -m src.train --architecture efficientnetb0 --smoke --splits-dir .\day1_artifacts
+```
+
+`--all --smoke` checks all three architectures sequentially. After that, explicitly start **one ImageNet-pretrained baseline**:
+
+```powershell
+python -m src.train --architecture efficientnetb0 --run --splits-dir .\day1_artifacts --outputs-dir .\outputs
+```
+
+Run the other baselines one at a time by replacing `efficientnetb0` with `mobilenetv2` or `resnet50`. To run all three sequentially with identical settings:
+
+```powershell
+python -m src.train --all --run --splits-dir .\day1_artifacts --outputs-dir .\outputs
+```
+
+The runner never starts full training without `--run`. It reads the existing `train.csv`, `validation.csv`, and `class_mapping.json`; it does not regenerate splits or open `test.csv`. It trains a frozen ImageNet backbone plus Global Average Pooling, Dense(128, ReLU), and Dense(7, softmax), with Adam at `1e-3`, batch size 32, at most 12 epochs, and early stopping after three epochs without improved full-validation macro F1. No augmentation, class weighting, dropout, or L2 is used. If memory requires batch size 16, add `--batch-size 16` to **every** Day 2 run for a fair comparison.
+
+Each `outputs/runs/<run_id>/` contains `config.json`, `best.keras`, `history.csv`, `validation_predictions.csv`, `metrics.json`, and `learning_curves.png`. The validation metrics and probabilities come from `best.keras`. `outputs/experiment_log.csv` has one row per completed run. Run IDs are unique and existing run directories are never replaced. Training requires ImageNet weight downloads on first use. This Windows environment currently detects no TensorFlow GPU, so full runs may be slow locally; Kaggle GPU is an option. Keep test predictions and scores closed until model choices are final.
 
 ## Data Splitting and Leakage Prevention
 

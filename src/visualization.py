@@ -57,3 +57,18 @@ def plot_first_batch(images: np.ndarray, labels: np.ndarray, output_dir: Path) -
     fig.tight_layout()
     fig.savefig(output_dir / "first_batch.png", dpi=150)
     plt.close(fig)
+
+
+def plot_learning_curves(history: pd.DataFrame, path: Path) -> None:
+    """Save training loss and full-validation macro F1 across epochs."""
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    axes[0].plot(history["epoch"], history["loss"], marker="o", label="train loss")
+    if "val_loss" in history:
+        axes[0].plot(history["epoch"], history["val_loss"], marker="o", label="validation loss")
+    axes[0].set(xlabel="Epoch", ylabel="Sparse cross-entropy", title="Learning loss")
+    axes[0].legend()
+    axes[1].plot(history["epoch"], history["val_macro_f1"], marker="o", color="teal")
+    axes[1].set(xlabel="Epoch", ylabel="Macro F1", title="Full validation set", ylim=(0, 1))
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
