@@ -126,3 +126,33 @@ def build_frozen_classifier(
 def parameter_counts(model: tf.keras.Model) -> dict[str, int]:
     trainable = sum(int(tf.size(weight)) for weight in model.trainable_weights)
     return {"total_parameters": int(model.count_params()), "trainable_parameters": trainable}
+
+
+def unfreeze_efficientnet_upper_stages(model: tf.keras.Model) -> dict:
+    """Train block6, block7, and top conv while keeping earlier layers and BN fixed."""
+    backbone = model.get_layer("efficientnetb0")
+    names = [layer.name for layer in backbone.layers]
+    for prefix in ("block6", "block7"):
+        if not any(name.startswith(prefix) for name in names):
+            raise ValueError(f"EfficientNet backbone has no {prefix} stage.")
+    if "top_conv" not in names:
+        raise ValueError("EfficientNet backbone has no top_conv layer.")
+    backbone.trainable = True
+    for layer in backbone.layers:
+        layer.trainable = (
+            (layer.name.startswith(("block6", "block7")) or layer.name == "top_conv")
+            and not isinstance(layer, tf.keras.layers.BatchNormalization)
+        )
+    trainable = [layer.name for layer in backbone.layers if layer.trainable]
+    frozen = [layer.name for layer in backbone.layers if not layer.trainable]
+    if not trainable or any(isinstance(layer, tf.keras.layers.BatchNormalization) and layer.trainable
+                            for layer in backbone.layers):
+        raise AssertionError("Upper-stage trainability boundary is invalid.")
+    return {
+        "boundary": "block6*, block7*, top_conv; all BatchNormalization frozen",
+        "backbone_trainable_layers": trainable,
+        "backbone_frozen_layers": frozen,
+        "backbone_trainable_parameters": sum(int(tf.size(weight)) for weight in backbone.trainable_weights),
+        "backbone_frozen_parameters": sum(int(tf.size(weight)) for weight in backbone.non_trainable_weights),
+        **parameter_counts(model),
+    }

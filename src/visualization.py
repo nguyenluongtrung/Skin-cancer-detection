@@ -87,3 +87,14 @@ def plot_learning_curves(history: pd.DataFrame, path: Path) -> None:
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
+
+
+def plot_confusion_matrix(matrix: np.ndarray, labels: list[str], path: Path) -> None:
+    """Save a validation confusion matrix in fixed class order."""
+    fig, ax = plt.subplots(figsize=(8, 7))
+    sns.heatmap(matrix, annot=True, fmt="d", cmap="Blues", xticklabels=labels,
+                yticklabels=labels, ax=ax)
+    ax.set(xlabel="Predicted", ylabel="True", title="Validation confusion matrix")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)

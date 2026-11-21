@@ -19,20 +19,21 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from sklearn.metrics import f1_score
+from sklearn.metrics import confusion_matrix, f1_score
 
 from .augmentation import build_moderate_augmentation
 from .compare import (HEAD_EXPERIMENT_STAGES, OPTIMIZER_NAMES,
                       write_head_experiment_comparisons, write_optimizer_comparison)
 from .data_pipeline import load_training_partitions, make_image_dataset, preprocess_for
 from .evaluate import evaluate_validation
-from .models import ARCHITECTURES, build_frozen_classifier, parameter_counts
+from .models import ARCHITECTURES, build_frozen_classifier, parameter_counts, unfreeze_efficientnet_upper_stages
 from .utils import append_experiment_log, create_run_directory, runtime_info, save_json, set_seed
-from .visualization import plot_augmentation_pairs, plot_learning_curves
+from .visualization import plot_augmentation_pairs, plot_confusion_matrix, plot_learning_curves
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "day2_frozen_no_aug.json"
 HEAD_EXPERIMENT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "frozen_head_experiments.json"
 OPTIMIZER_COMPARISON_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "frozen_optimizer_comparison.json"
+FINE_TUNE_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "efficientnetb0_partial_fine_tune.json"
 
 
 def load_config(path: Path) -> dict:
@@ -541,6 +542,266 @@ def smoke_one(architecture: str, *, config: dict, splits_dir: Path) -> dict:
     return result
 
 
+def load_fine_tune_config(path: Path, outputs_dir: Path) -> dict:
+    """Require the selected Day 4 recipe and fixed partial fine-tuning settings."""
+    config = json.loads(path.read_text(encoding="utf-8"))
+    reference_id = json.loads((outputs_dir / "day4_decisions.json").read_text(encoding="utf-8"))[-1]["selected_run_id"]
+    if config.get("parent_run_id") != reference_id:
+        raise ValueError("Fine-tuning parent must be the selected Day 4 checkpoint.")
+    row, parent, _ = logged_run(outputs_dir, reference_id)
+    if row.get("run_status") == "invalid" or parent.get("stage") != "T3_E0_L":
+        raise ValueError("Selected Day 4 parent is invalid or is not the L2 experiment.")
+    for key in ("architecture", "seed", "image_size", "batch_size", "pretrained_weights",
+                "augmentation", "class_weights", "dropout", "l2", "head_units", "loss", "selection_metric"):
+        if config.get(key) != parent.get(key):
+            raise ValueError(f"Fine-tuning config differs from selected parent on {key}.")
+    required = {"comparison_group": "efficientnetb0_partial_fine_tune", "optimizer": "adam",
+                "learning_rate": 1e-5, "beta_1": 0.9, "beta_2": 0.999,
+                "amsgrad": False, "max_epochs": 15, "reduce_lr_factor": 0.5,
+                "reduce_lr_patience": 2, "min_lr": 1e-7,
+                "early_stopping_patience": 5, "min_delta": 0.0}
+    for key, value in required.items():
+        if config.get(key) != value:
+            raise ValueError(f"Fine-tuning requires {key}={value!r}.")
+    return config
+
+
+def fine_tune_callbacks(validation_ds: tf.data.Dataset, labels: np.ndarray, checkpoint: Path, config: dict):
+    """Calculate full-validation F1 before every callback that monitors it."""
+    f1_callback = ValidationMacroF1(validation_ds, labels, num_classes=7)
+    return [
+        f1_callback,
+        tf.keras.callbacks.ModelCheckpoint(str(checkpoint), monitor="val_macro_f1",
+                                           mode="max", save_best_only=True),
+        tf.keras.callbacks.ReduceLROnPlateau(monitor="val_macro_f1", mode="max",
+                                             factor=config["reduce_lr_factor"],
+                                             patience=config["reduce_lr_patience"],
+                                             min_lr=config["min_lr"], min_delta=0.0),
+        tf.keras.callbacks.EarlyStopping(monitor="val_macro_f1", mode="max",
+                                         patience=config["early_stopping_patience"],
+                                         min_delta=0.0, restore_best_weights=True),
+    ], f1_callback
+
+
+def compile_fine_tune(model: tf.keras.Model, config: dict) -> None:
+    """Create a fresh Adam state after changing layer trainability."""
+    optimizer = tf.keras.optimizers.Adam(
+        learning_rate=config["learning_rate"], beta_1=config["beta_1"],
+        beta_2=config["beta_2"], amsgrad=config["amsgrad"],
+    )
+    settings = optimizer.get_config()
+    if settings.get("use_ema") or settings.get("weight_decay") not in (None, 0):
+        raise ValueError("Optimizer EMA or weight decay is enabled.")
+    model.compile(optimizer=optimizer, loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+                  metrics=[tf.keras.metrics.SparseCategoricalAccuracy(name="accuracy")])
+
+
+def audit_fine_tune_parent(config: dict, splits_dir: Path, outputs_dir: Path):
+    """Re-evaluate the untouched Day 4 checkpoint on ordered validation rows."""
+    parent_id = config["parent_run_id"]
+    _, parent_config, parent_metrics = logged_run(outputs_dir, parent_id)
+    parent_dir = outputs_dir / "runs" / parent_id
+    checkpoint = parent_dir / "best.keras"
+    if not checkpoint.is_file():
+        raise FileNotFoundError(checkpoint)
+    train, validation, mapping = load_training_partitions(splits_dir)
+    if mapping != parent_config["class_mapping"]:
+        raise ValueError("Current class mapping differs from the selected run.")
+    if Path(parent_config["splits_dir"]).resolve() != splits_dir.resolve():
+        raise ValueError("Selected parent used a different split directory.")
+    validation_ds = make_image_dataset(validation, training=False, batch_size=config["batch_size"],
+                                       architecture="efficientnetb0")
+    assert_validation_order(validation_ds, validation["class_index"].to_numpy())
+    sample, _ = next(iter(validation_ds.take(1)))
+    repeated, _ = next(iter(validation_ds.take(1)))
+    if not np.array_equal(sample.numpy(), repeated.numpy()):
+        raise AssertionError("Validation images changed between deterministic passes.")
+    if sample.shape[1:] != (224, 224, 3) or float(tf.reduce_min(sample)) < 0 or float(tf.reduce_max(sample)) > 255:
+        raise AssertionError("EfficientNet input shape or 0-255 range changed.")
+    raw, _ = next(iter(make_image_dataset(validation.head(config["batch_size"]),
+                                          batch_size=config["batch_size"])))
+    if not np.array_equal(sample.numpy(), preprocess_for("efficientnetb0")(raw).numpy()):
+        raise AssertionError("EfficientNet validation preprocessing changed.")
+    model = tf.keras.models.load_model(checkpoint, compile=False)
+    backbone = model.get_layer("efficientnetb0")
+    hidden = model.get_layer("dense_128")
+    output = model.get_layer("class_probabilities")
+    regularizer = tf.keras.regularizers.serialize(hidden.kernel_regularizer)
+    if (backbone.trainable or hidden.units != 128 or hidden.activation.__name__ != "relu"
+            or output.units != 7 or output.activation.__name__ != "softmax"
+            or not regularizer or not np.isclose(regularizer["config"]["l2"], 1e-4)):
+        raise AssertionError("Checkpoint architecture or hidden-layer L2 differs from Day 4.")
+    if len(model.get_layer("global_average_pooling").weights) != 0 or not np.isfinite(hidden.kernel.numpy()).all():
+        raise AssertionError("Checkpoint head has invalid weights.")
+    probabilities = model.predict(validation_ds, verbose=0)
+    predictions, metrics = evaluate_validation(validation, probabilities, mapping)
+    saved = pd.read_csv(parent_dir / "validation_predictions.csv")
+    if (not np.array_equal(predictions["image_id"].to_numpy(), saved["image_id"].to_numpy())
+            or not np.array_equal(predictions["true_class_index"].to_numpy(), saved["true_class_index"].to_numpy())
+            or not np.array_equal(predictions["predicted_class_index"].to_numpy(),
+                                  saved["predicted_class_index"].to_numpy())):
+        raise AssertionError("Saved validation prediction order or labels differ from checkpoint inference.")
+    tolerance = 1e-6
+    delta = abs(metrics["validation_macro_f1"] - parent_metrics["validation_macro_f1"])
+    if delta > tolerance:
+        raise AssertionError(f"Day 4 checkpoint macro F1 differs by {delta:.9g}; tolerance={tolerance}.")
+    return model, train, validation, mapping, validation_ds, metrics, {
+        "parent_run_id": parent_id, "parent_checkpoint": str(checkpoint.resolve()),
+        "parent_checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+        "parent_macro_f1_recomputed": metrics["validation_macro_f1"],
+        "parent_macro_f1_saved": parent_metrics["validation_macro_f1"],
+        "macro_f1_difference": delta, "macro_f1_tolerance": tolerance,
+        "split_file_sha256": {name: hashlib.sha256((splits_dir / name).read_bytes()).hexdigest()
+                              for name in ("train.csv", "validation.csv", "class_mapping.json", "split_manifest.json")},
+    }
+
+
+def smoke_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> dict:
+    """Verify gradients, frozen state, BN state, and reload on a disposable model."""
+    tf.keras.backend.clear_session()
+    set_seed(config["seed"])
+    model, train, validation, mapping, validation_ds, parent_metrics, audit = audit_fine_tune_parent(
+        config, splits_dir, outputs_dir)
+    boundary = unfreeze_efficientnet_upper_stages(model)
+    compile_fine_tune(model, config)
+    backbone = model.get_layer("efficientnetb0")
+    upper = backbone.get_layer("top_conv").kernel
+    earlier = backbone.get_layer("block5a_expand_conv").kernel
+    head = model.get_layer("dense_128").kernel
+    bn_weights = [weight for layer in backbone.layers if isinstance(layer, tf.keras.layers.BatchNormalization)
+                  for weight in (layer.moving_mean, layer.moving_variance)]
+    before = [weight.numpy().copy() for weight in (upper, earlier, head, *bn_weights)]
+    train_ds = make_image_dataset(train.head(2), training=True, batch_size=2,
+                                  architecture="efficientnetb0", augment=None, seed=config["seed"])
+    images, labels = next(iter(train_ds))
+    loss = float(model.train_on_batch(images, labels)[0])
+    after = [weight.numpy() for weight in (upper, earlier, head, *bn_weights)]
+    differences = [float(np.max(np.abs(a - b))) for a, b in zip(after, before)]
+    if not np.isfinite(loss) or differences[0] <= 0 or differences[2] <= 0 or any(d != 0 for d in
+                                                                                    (differences[1], *differences[3:])):
+        raise AssertionError(f"Fine-tuning weight isolation failed: {differences}")
+    with tempfile.TemporaryDirectory(prefix="ham_fine_tune_smoke_") as temporary:
+        path = Path(temporary) / "disposable.keras"
+        model.save(path)
+        restored = tf.keras.models.load_model(path, compile=False)
+        difference = float(np.max(np.abs(model(images, training=False).numpy()
+                                         - restored(images, training=False).numpy())))
+    if difference > 1e-5:
+        raise AssertionError(f"Reload changed inference outputs by {difference}.")
+    result = {**audit, **boundary, "smoke_only": True, "one_batch_loss": loss,
+              "weight_max_changes_upper_frozen_head": differences[:3],
+              "batch_norm_moving_stat_max_change": max(differences[3:]),
+              "batch_norm_moving_stat_tensors_checked": len(bn_weights),
+              "reload_max_probability_difference": difference,
+              "augmentation": False, "class_weights": False,
+              "validation_images": len(validation), "training_images": len(train),
+              "parent_validation_macro_f1": parent_metrics["validation_macro_f1"]}
+    save_json(result, outputs_dir / "day6_preflight.json")
+    print(json.dumps(result, indent=2))
+    return result
+
+
+def train_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> tuple[str, dict]:
+    """Fine-tune from a freshly reloaded Day 4 checkpoint and compare on validation."""
+    tf.keras.backend.clear_session()
+    set_seed(config["seed"])
+    model, train, validation, mapping, validation_ds, parent_metrics, audit = audit_fine_tune_parent(
+        config, splits_dir, outputs_dir)
+    boundary = unfreeze_efficientnet_upper_stages(model)
+    compile_fine_tune(model, config)
+    train_ds = make_image_dataset(train, training=True, batch_size=config["batch_size"],
+                                  architecture="efficientnetb0", augment=None, seed=config["seed"])
+    run_id, run_dir = create_run_directory(outputs_dir, "efficientnetb0_fine_tune")
+    checkpoint = run_dir / "best.keras"
+    save_json({**config, **audit, **boundary, "run_id": run_id,
+               "splits_dir": str(splits_dir.resolve()), "class_mapping": mapping,
+               "preprocessing": "original RGB 0-255; EfficientNet internal rescaling",
+               "backbone_call_training": False,
+               "loss_note": "Logged total loss includes hidden-layer L2 regularization."}, run_dir / "config.json")
+    callbacks, f1_callback = fine_tune_callbacks(
+        validation_ds, validation["class_index"].to_numpy(dtype=int), checkpoint, config)
+    started = time.perf_counter()
+    history = model.fit(train_ds, validation_data=validation_ds, epochs=config["max_epochs"],
+                        callbacks=callbacks, verbose=2)
+    duration = time.perf_counter() - started
+    frame = pd.DataFrame(history.history)
+    frame.insert(0, "epoch", np.arange(1, len(f1_callback.scores) + 1))
+    frame["val_macro_f1"] = f1_callback.scores
+    frame["learning_rate"] = f1_callback.learning_rates
+    frame.to_csv(run_dir / "history.csv", index=False)
+    plot_learning_curves(frame, run_dir / "learning_curves.png")
+    best_epoch = int(np.argmax(f1_callback.scores) + 1)
+    if not checkpoint.is_file():
+        raise AssertionError("Fine-tuning saved no best checkpoint.")
+    best = tf.keras.models.load_model(checkpoint, compile=False)
+    predictions, scores = evaluate_validation(validation, best.predict(validation_ds, verbose=0), mapping)
+    if not np.isclose(scores["validation_macro_f1"], f1_callback.scores[best_epoch - 1], atol=1e-7):
+        raise AssertionError("Best fine-tuning checkpoint does not match epoch F1.")
+    predictions.to_csv(run_dir / "validation_predictions.csv", index=False)
+    names = [name for name, _ in sorted(mapping.items(), key=lambda item: item[1])]
+    matrix = confusion_matrix(predictions.true_class_index, predictions.predicted_class_index,
+                              labels=list(range(7)))
+    pd.DataFrame(matrix, index=names, columns=names).to_csv(run_dir / "confusion_matrix.csv")
+    plot_confusion_matrix(matrix, names, run_dir / "confusion_matrix.png")
+    pd.DataFrame(matrix / np.maximum(matrix.sum(axis=1, keepdims=True), 1),
+                 index=names, columns=names).to_csv(run_dir / "confusion_matrix_normalized.csv")
+    parent_saved = logged_run(outputs_dir, config["parent_run_id"])[2]
+    comparison = {key: {"frozen": parent_metrics[key], "fine_tuned": scores[key],
+                        "change": scores[key] - parent_metrics[key]}
+                  for key in ("validation_accuracy", "validation_macro_f1", "validation_balanced_accuracy")}
+    per_class = pd.DataFrame([{"class": name, "support": scores["per_class"][name]["support"],
+                               **{f"frozen_{metric}": parent_saved["per_class"][name][metric]
+                                  for metric in ("precision", "recall", "f1")},
+                               **{f"fine_tuned_{metric}": scores["per_class"][name][metric]
+                                  for metric in ("precision", "recall", "f1")},
+                               **{f"change_{metric}": scores["per_class"][name][metric]
+                                  - parent_saved["per_class"][name][metric]
+                                  for metric in ("precision", "recall", "f1")}} for name in names])
+    per_class.to_csv(run_dir / "per_class_comparison.csv", index=False)
+    reductions = [int(i + 1) for i in range(1, len(f1_callback.learning_rates))
+                  if f1_callback.learning_rates[i] < f1_callback.learning_rates[i - 1]]
+    retained = run_id if scores["validation_macro_f1"] > parent_metrics["validation_macro_f1"] else config["parent_run_id"]
+    lowest_recall = sorted(names, key=lambda name: scores["per_class"][name]["recall"])[:2]
+    interpretation = (
+        f"Validation macro F1 changed by {comparison['validation_macro_f1']['change']:+.6f} "
+        f"in this single run. Lowest fine-tuned recall: {', '.join(lowest_recall)}. "
+        f"Training loss moved from {frame['loss'].iloc[0]:.4f} to {frame['loss'].iloc[-1]:.4f}; "
+        f"validation loss moved from {frame['val_loss'].iloc[0]:.4f} to {frame['val_loss'].iloc[-1]:.4f}. "
+        "These are observed validation results, not a causal estimate of fine-tuning benefit."
+    )
+    runtime = runtime_info(config["batch_size"])
+    metrics = {"run_id": run_id, "parent_run_id": config["parent_run_id"], **scores,
+               "actual_epochs": len(frame), "best_epoch": best_epoch,
+               "learning_rate_reduction_epochs": reductions, "training_seconds": duration,
+               "best_checkpoint": str(checkpoint.resolve()), "retained_candidate_run_id": retained,
+               "comparison": comparison, "interpretation": interpretation,
+               "logged_loss_includes_l2": True,
+               "framework_versions": {key: runtime[key] for key in
+                                      ("python", "tensorflow", "keras", "pandas", "numpy", "scikit_learn")},
+               "detected_training_device": "GPU" if runtime["gpus"] else "CPU",
+               "visible_gpus": runtime["gpus"], **boundary, **audit}
+    save_json(metrics, run_dir / "metrics.json")
+    save_json({"retained_candidate_run_id": retained, "frozen_parent_run_id": config["parent_run_id"],
+               "fine_tuned_run_id": run_id, "comparison": comparison,
+               "best_epoch": best_epoch, "actual_epochs": len(frame),
+               "learning_rate_reduction_epochs": reductions,
+               "interpretation": interpretation}, run_dir / "decision.json")
+    append_experiment_log(outputs_dir, {
+        "run_id": run_id, "comparison_group": config["comparison_group"],
+        "parent_run_id": config["parent_run_id"], "comparator_run_id": config["parent_run_id"],
+        "architecture": "efficientnetb0", "augmentation": False, "class_weights": False,
+        "dropout": 0.0, "l2": config["l2"], "optimizer": "adam",
+        "learning_rate": config["learning_rate"], "batch_size": config["batch_size"],
+        "seed": config["seed"], "actual_epochs": len(frame), "best_epoch": best_epoch,
+        **{key: scores[key] for key in comparison}, "training_seconds": duration,
+        "total_parameters": boundary["total_parameters"],
+        "trainable_parameters": boundary["trainable_parameters"],
+        "detected_training_device": metrics["detected_training_device"],
+        "run_dir": str(run_dir), "logged_loss_includes_l2": True, "run_status": "valid"})
+    print(json.dumps({"run_id": run_id, "decision": retained, "comparison": comparison}, indent=2))
+    return run_id, metrics
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     architecture_group = parser.add_mutually_exclusive_group(required=True)
@@ -549,6 +810,8 @@ def main() -> None:
     architecture_group.add_argument("--stage", choices=HEAD_EXPERIMENT_STAGES, help="Run one sequential head experiment")
     architecture_group.add_argument("--optimizer-choice", choices=OPTIMIZER_NAMES,
                                     help="Run one five-epoch frozen optimizer comparison")
+    architecture_group.add_argument("--fine-tune", action="store_true",
+                                    help="Audit and partially fine-tune selected Day 4 EfficientNetB0")
     action_group = parser.add_mutually_exclusive_group(required=True)
     action_group.add_argument("--smoke", action="store_true", help="Tiny random-weight pipeline and checkpoint check")
     action_group.add_argument("--run", action="store_true", help="Start full ImageNet frozen training")
@@ -564,6 +827,16 @@ def main() -> None:
         parser.error("Optimizer comparison requires --run and its fixed configured settings.")
     if args.parent_run_id and not args.stage:
         parser.error("--parent-run-id is only for head experiments.")
+    if args.fine_tune:
+        if args.batch_size or args.parent_run_id:
+            parser.error("Fine-tuning uses the fixed batch size and selected Day 4 parent.")
+        config_path = FINE_TUNE_CONFIG if args.config == DEFAULT_CONFIG else args.config
+        config = load_fine_tune_config(config_path, args.outputs_dir)
+        if args.smoke:
+            smoke_fine_tune(config, args.splits_dir, args.outputs_dir)
+        else:
+            train_fine_tune(config, args.splits_dir, args.outputs_dir)
+        return
     config_path = (OPTIMIZER_COMPARISON_CONFIG if args.optimizer_choice and args.config == DEFAULT_CONFIG
                    else HEAD_EXPERIMENT_CONFIG if args.stage and args.config == DEFAULT_CONFIG else args.config)
     config = (load_optimizer_comparison_config(config_path, args.outputs_dir) if args.optimizer_choice

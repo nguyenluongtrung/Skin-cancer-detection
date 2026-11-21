@@ -596,6 +596,23 @@ All three five-epoch runs completed. They used the same split-file hashes and in
 
 Adam is the provisional winner for this optimizer-plus-learning-rate comparison. The Day 4 L2 checkpoint scored **0.621915** with a longer, up-to-12-epoch budget; it is a separate reference and remains the selected checkpoint. A matched longer-budget comparison is warranted before using the short-run ranking to choose a different optimizer for the next stage. These results do not show that one optimizer is universally better. Test data and metrics remain closed.
 
+### Day 6 partial fine-tuning
+
+The starting checkpoint is `outputs/runs/20261121T134510640652Z_t3_e0_l_e8ee6a73/best.keras`, selected on Day 4. Its SHA-256 is `930b48be4988dd4e867a763189e71eba5ebb4b52527c5abf2aa87d93395bf4d8`. The validation audit reloaded it without optimizer state and reproduced macro F1 `0.6219153840498015`, exactly matching the saved full-precision value; the acceptance tolerance is `1e-6`. The displayed `0.6219` is rounded. Saved train and validation contain 7,153 and 1,431 images respectively, all seven classes, and no overlapping lesion IDs. The class order is `akiec, bcc, bkl, df, mel, nv, vasc`. Validation stays unshuffled and unaugmented. JPEGs decode to RGB, resize to 224 by 224, and keep 0–255 values for EfficientNet's internal rescaling.
+
+The Day 4 checkpoint has GAP, a 128-unit ReLU layer with kernel L2 `1e-4`, and seven-class softmax. Its weakest validation recall was `df` (0.2500) and `mel` (0.3522); `nv` recall was 0.9322. Across Day 4 epochs, training loss fell from 0.8161 to 0.2630, while validation loss reached 0.7378 at epoch 12 after a lower value of 0.6389 at epoch 3. These observations do not identify a cause for the class errors.
+
+The fine-tuning boundary is EfficientNet layers starting with `block6` or `block7`, plus `top_conv`; every earlier stage and all backbone BatchNormalization layers stay frozen. The exact layer lists and counts are recorded in each new run's `config.json`. The backbone is still called with `training=False`: this controls BatchNormalization and other training-mode behavior, while gradients still flow through trainable convolution kernels. The classification head remains trainable. Training starts from the Day 4 learned weights, recompiles with fresh Adam at `1e-5`, and runs at most 15 additional epochs. Full-validation macro F1 drives checkpointing, learning-rate reduction, and early stopping. No augmentation or class weighting is used.
+
+Run the audit and disposable update check, then explicitly start the full experiment from the repository root:
+
+```powershell
+.venv\Scripts\python.exe -m src.train --fine-tune --smoke --config configs/efficientnetb0_partial_fine_tune.json
+.venv\Scripts\python.exe -m src.train --fine-tune --run --config configs/efficientnetb0_partial_fine_tune.json
+```
+
+The smoke command writes `outputs/day6_preflight.json` with the audit and exact layer lists and parameter counts. The full command creates a unique `outputs/runs/<run_id>/` with the resolved config, parent and split hashes, trainability lists, best checkpoint, epoch history, validation predictions, per-class comparison, confusion matrices, learning curves, metrics, and a keep/reject decision. It appends `outputs/experiment_log.csv`. The frozen checkpoint remains available regardless of the decision. Logged total loss includes the hidden-layer L2 term. Only validation is evaluated; test remains closed.
+
 | Model                | Test accuracy | Test macro F1 | Test balanced accuracy |
 | -------------------- | ------------: | ------------: | ---------------------: |
 | Baseline             |       Pending |       Pending |                Pending |
