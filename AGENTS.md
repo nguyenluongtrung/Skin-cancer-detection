@@ -2,11 +2,11 @@
 
 ## Project Structure & Module Organization
 
-`src/prepare_data.py` audits HAM10000 and manages fixed lesion-grouped splits. `src/data_pipeline.py` handles RGB decoding, resizing, model-specific preprocessing, and datasets. `src/models.py` builds frozen ImageNet classifiers; `src/train.py` runs Day 2 baselines; `src/evaluate.py` scores validation predictions. Shared helpers and plots live in `src/utils.py` and `src/visualization.py`. `notebooks/01_eda.ipynb` imports these modules. `scripts/download_ham10000_isic.py` downloads the official ISIC release. Generated `data/`, `day1_artifacts/`, and `outputs/` are ignored by Git.
+`src/prepare_data.py` audits HAM10000 and manages fixed lesion-grouped splits. `src/data_pipeline.py` decodes and preprocesses images; `src/augmentation.py` defines the training-only policy. `src/models.py` builds frozen classifiers; `src/train.py` runs Day 2 and Day 3 recipes; `src/evaluate.py` scores validation; `src/compare.py` summarizes six runs. Helpers and plots live in `src/utils.py` and `src/visualization.py`. `notebooks/01_eda.ipynb` imports these modules. `scripts/download_ham10000_isic.py` downloads the official ISIC release. Generated `data/`, `day1_artifacts/`, and `outputs/` are ignored by Git.
 
 ## Build, Test, and Development Commands
 
-Install dependencies with `python -m pip install -r requirements.txt`. If needed, download data with `python -m scripts.download_ham10000_isic --output-dir data`. Run the Day 2 pipeline check with `python -m src.train --architecture efficientnetb0 --smoke`; explicitly start one baseline with `python -m src.train --architecture efficientnetb0 --run`. Run all three sequentially with `python -m src.train --all --run`. Commands read saved splits in `day1_artifacts/` and write completed runs to `outputs/`. Run tests with `python -m unittest discover -s tests -v`. There is no build step.
+Install with `python -m pip install -r requirements.txt`. If needed, download data with `python -m scripts.download_ham10000_isic --output-dir data`. Check Day 3 with `python -m src.train --architecture efficientnetb0 --smoke --config configs/day3_frozen_aug.json`; explicitly train with `--run`. After three augmented runs, summarize with `python -m src.compare --outputs-dir outputs`. Commands reuse `day1_artifacts/` and write to `outputs/`. Run tests with `python -m unittest discover -s tests -v`. There is no build step.
 
 ## Coding Style & Naming Conventions
 

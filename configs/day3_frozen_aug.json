@@ -1,0 +1,27 @@
+{
+  "comparison_group": "day3_frozen_moderate_augmentation",
+  "architectures": ["efficientnetb0", "mobilenetv2", "resnet50"],
+  "seed": 42,
+  "image_size": [224, 224],
+  "batch_size": 32,
+  "max_epochs": 12,
+  "early_stopping_patience": 3,
+  "pretrained_weights": "imagenet",
+  "backbone_trainable": false,
+  "augmentation": true,
+  "augmentation_policy": {
+    "flips": "horizontal_and_vertical",
+    "rotation_degrees": 20,
+    "zoom_fraction": 0.10,
+    "brightness_fraction_of_255": 0.08,
+    "input_value_range": [0, 255]
+  },
+  "class_weights": false,
+  "dropout": 0,
+  "l2": 0,
+  "head_units": 128,
+  "optimizer": "adam",
+  "learning_rate": 0.001,
+  "loss": "sparse_categorical_crossentropy",
+  "selection_metric": "val_macro_f1"
+}

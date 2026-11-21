@@ -59,6 +59,21 @@ def plot_first_batch(images: np.ndarray, labels: np.ndarray, output_dir: Path) -
     plt.close(fig)
 
 
+def plot_augmentation_pairs(original: np.ndarray, augmented: np.ndarray, labels: np.ndarray, path: Path) -> None:
+    """Show one original and one augmented training image for each class."""
+    if original.shape != augmented.shape or len(original) != len(labels):
+        raise ValueError("Original, augmented, and label counts must match.")
+    fig, axes = plt.subplots(2, len(labels), figsize=(2.2 * len(labels), 5))
+    for column, label in enumerate(labels):
+        for row, batch in enumerate((original, augmented)):
+            axes[row, column].imshow(np.clip(batch[column], 0, 255).astype(np.uint8))
+            axes[row, column].set_title(f"{CLASSES[int(label)]}: {'original' if row == 0 else 'augmented'}", fontsize=9)
+            axes[row, column].axis("off")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 def plot_learning_curves(history: pd.DataFrame, path: Path) -> None:
     """Save training loss and full-validation macro F1 across epochs."""
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))

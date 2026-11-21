@@ -95,7 +95,11 @@ def make_image_dataset(
         dataset = dataset.shuffle(len(frame), seed=seed, reshuffle_each_iteration=True)
     dataset = dataset.map(decode_resize, num_parallel_calls=tf.data.AUTOTUNE)
     if augment is not None:
-        dataset = dataset.map(lambda image, label: (augment(image), label), num_parallel_calls=tf.data.AUTOTUNE)
+        # Stateful random layers run in dataset order for repeatable seeded runs.
+        dataset = dataset.map(
+            lambda image, label: (tf.ensure_shape(augment(image, training=True), (224, 224, 3)), label),
+            num_parallel_calls=1,
+        )
     if architecture is not None:
         preprocess = preprocess_for(architecture)
         dataset = dataset.map(lambda image, label: (preprocess(image), label), num_parallel_calls=tf.data.AUTOTUNE)
