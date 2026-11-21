@@ -4,11 +4,13 @@ Examples (repository root):
     python -m src.train --architecture efficientnetb0 --smoke
     python -m src.train --architecture efficientnetb0 --run
     python -m src.train --all --run
+    python -m src.train --optimizer-choice adam --config configs/frozen_optimizer_comparison.json --run
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import tempfile
 import time
@@ -20,7 +22,8 @@ import tensorflow as tf
 from sklearn.metrics import f1_score
 
 from .augmentation import build_moderate_augmentation
-from .compare import HEAD_EXPERIMENT_STAGES, write_head_experiment_comparisons
+from .compare import (HEAD_EXPERIMENT_STAGES, OPTIMIZER_NAMES,
+                      write_head_experiment_comparisons, write_optimizer_comparison)
 from .data_pipeline import load_training_partitions, make_image_dataset, preprocess_for
 from .evaluate import evaluate_validation
 from .models import ARCHITECTURES, build_frozen_classifier, parameter_counts
@@ -29,6 +32,7 @@ from .visualization import plot_augmentation_pairs, plot_learning_curves
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "day2_frozen_no_aug.json"
 HEAD_EXPERIMENT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "frozen_head_experiments.json"
+OPTIMIZER_COMPARISON_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "frozen_optimizer_comparison.json"
 
 
 def load_config(path: Path) -> dict:
@@ -93,6 +97,59 @@ def load_head_experiment_config(path: Path) -> dict:
     if config.get("architecture") != "efficientnetb0":
         raise ValueError("Selected architecture must be efficientnetb0.")
     return config
+
+
+def load_optimizer_comparison_config(path: Path, outputs_dir: Path) -> dict:
+    """Check the short-budget comparison against the selected frozen recipe."""
+    config = json.loads(path.read_text(encoding="utf-8"))
+    reference_id = config.get("reference_run_id")
+    if not reference_id:
+        raise ValueError("Optimizer comparison requires the selected Day 4 reference run ID.")
+    row, reference, _ = logged_run(outputs_dir, reference_id)
+    if (row.get("run_status") == "invalid" or reference.get("stage") != "T3_E0_L"
+            or reference.get("architecture") != "efficientnetb0"):
+        raise ValueError("Reference must be the valid selected L2 run.")
+    decisions = json.loads((outputs_dir / "day4_decisions.json").read_text(encoding="utf-8"))
+    if decisions[-1]["selected_run_id"] != reference_id:
+        raise ValueError("Reference differs from the Day 4 validation decision.")
+    for key in ("architecture", "seed", "image_size", "batch_size", "pretrained_weights",
+                "backbone_trainable", "augmentation", "head_units", "class_weights",
+                "dropout", "l2", "loss", "selection_metric"):
+        if config.get(key) != reference.get(key):
+            raise ValueError(f"Optimizer comparison differs from selected recipe on {key}.")
+    if config.get("comparison_group") != "frozen_optimizer_comparison" or config.get("max_epochs") != 5:
+        raise ValueError("Optimizer comparison requires its own group and exactly five epochs.")
+    expected = {
+        "adam": {"learning_rate": 0.001, "beta_1": 0.9, "beta_2": 0.999, "amsgrad": False},
+        "rmsprop": {"learning_rate": 0.001, "rho": 0.9, "momentum": 0.0, "centered": False},
+        "sgd_momentum": {"learning_rate": 0.01, "momentum": 0.9, "nesterov": False},
+    }
+    if config.get("optimizers") != expected:
+        raise ValueError("Optimizer settings differ from the controlled comparison plan.")
+    return config
+
+
+def build_comparison_optimizer(name: str, settings: dict) -> tf.keras.optimizers.Optimizer:
+    """Create an optimizer with fresh state and framework-default epsilon."""
+    constructors = {
+        "adam": tf.keras.optimizers.Adam,
+        "rmsprop": tf.keras.optimizers.RMSprop,
+        "sgd_momentum": tf.keras.optimizers.SGD,
+    }
+    optimizer = constructors[name](**settings)
+    resolved = optimizer.get_config()
+    if resolved.get("use_ema") or resolved.get("weight_decay") not in (None, 0):
+        raise ValueError("Optimizer EMA and optimizer weight decay must be disabled.")
+    return optimizer
+
+
+def initial_head_digest(model: tf.keras.Model) -> str:
+    """Fingerprint head initialization for cross-run fairness checks."""
+    digest = hashlib.sha256()
+    for name in ("dense_128", "class_probabilities"):
+        for weight in model.get_layer(name).get_weights():
+            digest.update(np.asarray(weight).tobytes())
+    return digest.hexdigest()
 
 
 def training_class_weights(train: pd.DataFrame, mapping: dict[str, int]) -> dict[int, float]:
@@ -212,13 +269,32 @@ def baseline_callbacks(validation_ds: tf.data.Dataset, labels: np.ndarray, check
     return [f1_callback, checkpoint_callback, stop_callback], f1_callback
 
 
+def comparison_callbacks(validation_ds: tf.data.Dataset, labels: np.ndarray, checkpoint: Path):
+    """Checkpoint macro F1 without stopping or changing the learning rate."""
+    f1_callback = ValidationMacroF1(validation_ds, labels, num_classes=7)
+    checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
+        filepath=str(checkpoint), monitor="val_macro_f1", mode="max", save_best_only=True,
+    )
+    return [f1_callback, checkpoint_callback], f1_callback
+
+
 def train_one(
     architecture: str, *, config: dict, splits_dir: Path, outputs_dir: Path, batch_size: int,
     stage: str | None = None, parent_run_id: str | None = None,
+    optimizer_name: str | None = None,
 ) -> tuple[str, dict]:
     """Train one fresh ImageNet frozen model and score its best checkpoint."""
     train, validation, mapping = load_training_partitions(splits_dir)
-    if stage:
+    if optimizer_name:
+        existing_log = pd.read_csv(outputs_dir / "experiment_log.csv")
+        existing = existing_log.loc[
+            (existing_log.comparison_group == config["comparison_group"])
+            & (existing_log.optimizer == optimizer_name)
+        ]
+        if not existing.empty:
+            raise ValueError(f"{optimizer_name} already has a comparison run; existing outputs will not be overwritten.")
+        parent_id, use_weights, dropout, l2 = None, False, 0.0, config["l2"]
+    elif stage:
         baseline_id = baseline_comparator(outputs_dir, architecture, batch_size)
         parent_id, use_weights, dropout, l2 = select_head_experiment_parent(stage, outputs_dir, parent_run_id, baseline_id)
         if not valid_stage_rows(pd.read_csv(outputs_dir / "experiment_log.csv"), stage).empty:
@@ -241,7 +317,16 @@ def train_one(
     )
     if backbone.trainable or backbone.trainable_weights:
         raise AssertionError("Backbone is not fully frozen.")
-    compile_baseline(model)
+    head_digest = initial_head_digest(model) if optimizer_name else None
+    optimizer = build_comparison_optimizer(optimizer_name, config["optimizers"][optimizer_name]) if optimizer_name else None
+    if optimizer is None:
+        compile_baseline(model)
+    else:
+        model.compile(
+            optimizer=optimizer,
+            loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+            metrics=[tf.keras.metrics.SparseCategoricalAccuracy(name="accuracy")],
+        )
     counts = parameter_counts(model)
     augment = build_moderate_augmentation(config["seed"]) if config["augmentation"] else None
     train_ds = make_image_dataset(
@@ -251,7 +336,8 @@ def train_one(
     validation_ds = make_image_dataset(validation, training=False, batch_size=batch_size, architecture=architecture)
     assert_validation_order(validation_ds, validation["class_index"].to_numpy())
 
-    run_id, run_dir = create_run_directory(outputs_dir, stage.lower() if stage else architecture)
+    run_label = f"{architecture}_{optimizer_name}" if optimizer_name else (stage.lower() if stage else architecture)
+    run_id, run_dir = create_run_directory(outputs_dir, run_label)
     checkpoint = run_dir / "best.keras"
     run_config = {
         **config, "run_id": run_id, "architecture": architecture,
@@ -266,6 +352,20 @@ def train_one(
         "dropout": dropout, "l2": l2,
         "loss_note": "Logged loss includes L2 when enabled; class weights apply to training loss only. Validation metrics are unweighted. Losses across different objectives are not directly comparable.",
     }
+    if optimizer_name:
+        split_files = ("train.csv", "validation.csv", "class_mapping.json", "split_manifest.json")
+        run_config.update({
+            "optimizer": optimizer_name,
+            "optimizer_settings": optimizer.get_config(),
+            "learning_rate": config["optimizers"][optimizer_name]["learning_rate"],
+            "initial_head_sha256": head_digest,
+            "split_file_sha256": {
+                name: hashlib.sha256((Path(splits_dir) / name).read_bytes()).hexdigest()
+                for name in split_files
+            },
+            "training_policy": "five complete epochs; no early stopping or learning-rate callbacks",
+            "reference_validation_macro_f1": logged_run(outputs_dir, config["reference_run_id"])[2]["validation_macro_f1"],
+        })
     save_json(run_config, run_dir / "config.json")
     if augment is not None:
         examples = train.groupby("class_index", sort=True, group_keys=False).head(1)
@@ -273,16 +373,27 @@ def train_one(
         montage_augment = build_moderate_augmentation(config["seed"])
         changed = montage_augment(originals, training=True).numpy()
         plot_augmentation_pairs(originals.numpy(), changed, example_labels.numpy(), run_dir / "augmentation_examples.png")
-    callbacks, f1_callback = baseline_callbacks(
-        validation_ds, validation["class_index"].to_numpy(dtype=int),
-        checkpoint, config["early_stopping_patience"],
-    )
+    if optimizer_name:
+        callbacks, f1_callback = comparison_callbacks(
+            validation_ds, validation["class_index"].to_numpy(dtype=int), checkpoint,
+        )
+    else:
+        callbacks, f1_callback = baseline_callbacks(
+            validation_ds, validation["class_index"].to_numpy(dtype=int),
+            checkpoint, config["early_stopping_patience"],
+        )
     started = time.perf_counter()
     history = model.fit(
         train_ds, validation_data=validation_ds, epochs=config["max_epochs"],
         callbacks=callbacks, class_weight=class_weights, verbose=2,
     )
     duration = time.perf_counter() - started
+    if optimizer_name:
+        expected_updates = config["max_epochs"] * int(np.ceil(len(train) / batch_size))
+        if len(f1_callback.scores) != 5 or int(optimizer.iterations.numpy()) != expected_updates:
+            raise AssertionError("Short comparison did not complete five epochs with equal update counts.")
+        if not np.allclose(f1_callback.learning_rates, config["optimizers"][optimizer_name]["learning_rate"]):
+            raise AssertionError("Optimizer learning rate changed during the short comparison.")
     if not checkpoint.is_file():
         raise AssertionError("No best checkpoint was saved.")
     history_frame = pd.DataFrame(history.history)
@@ -314,12 +425,18 @@ def train_one(
         "stage": stage, "parent_run_id": parent_id, "class_weight_values": class_weights,
         "logged_loss_includes_l2": bool(l2),
     }
+    if optimizer_name:
+        metrics.update({"optimizer": optimizer_name, "optimizer_settings": optimizer.get_config(),
+                        "optimizer_updates": expected_updates, "initial_head_sha256": head_digest,
+                        "split_file_sha256": run_config["split_file_sha256"],
+                        "reference_run_id": config["reference_run_id"]})
     save_json(metrics, run_dir / "metrics.json")
     append_experiment_log(outputs_dir, {
         "run_id": run_id, "comparison_group": stage or config["comparison_group"],
         "parent_run_id": parent_id or "", "comparator_run_id": comparator_run_id or "", "architecture": architecture,
         "augmentation": bool(config["augmentation"]), "class_weights": use_weights,
-        "dropout": dropout, "l2": l2, "optimizer": "adam", "learning_rate": 1e-3,
+        "dropout": dropout, "l2": l2, "optimizer": optimizer_name or "adam",
+        "learning_rate": config["optimizers"][optimizer_name]["learning_rate"] if optimizer_name else 1e-3,
         "batch_size": batch_size, "seed": config["seed"],
         "actual_epochs": metrics["actual_epochs"], "best_epoch": best_epoch,
         "validation_accuracy": scores["validation_accuracy"],
@@ -330,9 +447,13 @@ def train_one(
         "run_dir": str(run_dir),
         "logged_loss_includes_l2": bool(l2),
         "run_status": "valid",
+        "optimizer_updates": expected_updates if optimizer_name else "",
+        "initial_head_sha256": head_digest or "",
     })
     if stage:
         write_head_experiment_comparisons(outputs_dir, mapping)
+    if optimizer_name:
+        write_optimizer_comparison(outputs_dir, config["reference_run_id"])
     print(f"Saved run {run_id}: best epoch {best_epoch}, validation macro F1 {scores['validation_macro_f1']:.4f}")
     return run_id, metrics
 
@@ -426,6 +547,8 @@ def main() -> None:
     architecture_group.add_argument("--architecture", choices=ARCHITECTURES)
     architecture_group.add_argument("--all", action="store_true", help="Run all three architectures sequentially")
     architecture_group.add_argument("--stage", choices=HEAD_EXPERIMENT_STAGES, help="Run one sequential head experiment")
+    architecture_group.add_argument("--optimizer-choice", choices=OPTIMIZER_NAMES,
+                                    help="Run one five-epoch frozen optimizer comparison")
     action_group = parser.add_mutually_exclusive_group(required=True)
     action_group.add_argument("--smoke", action="store_true", help="Tiny random-weight pipeline and checkpoint check")
     action_group.add_argument("--run", action="store_true", help="Start full ImageNet frozen training")
@@ -437,12 +560,16 @@ def main() -> None:
     args = parser.parse_args()
     if args.stage and (args.smoke or args.batch_size):
         parser.error("Head experiments require --run and the fixed configured batch size.")
+    if args.optimizer_choice and (args.smoke or args.batch_size or args.parent_run_id):
+        parser.error("Optimizer comparison requires --run and its fixed configured settings.")
     if args.parent_run_id and not args.stage:
         parser.error("--parent-run-id is only for head experiments.")
-    config_path = HEAD_EXPERIMENT_CONFIG if args.stage and args.config == DEFAULT_CONFIG else args.config
-    config = load_head_experiment_config(config_path) if args.stage else load_config(config_path)
+    config_path = (OPTIMIZER_COMPARISON_CONFIG if args.optimizer_choice and args.config == DEFAULT_CONFIG
+                   else HEAD_EXPERIMENT_CONFIG if args.stage and args.config == DEFAULT_CONFIG else args.config)
+    config = (load_optimizer_comparison_config(config_path, args.outputs_dir) if args.optimizer_choice
+              else load_head_experiment_config(config_path) if args.stage else load_config(config_path))
     batch_size = args.batch_size or config["batch_size"]
-    architectures = config["architectures"] if args.all else [config["architecture"] if args.stage else args.architecture]
+    architectures = config["architectures"] if args.all else [config["architecture"] if args.stage or args.optimizer_choice else args.architecture]
     for architecture in architectures:
         if args.smoke:
             smoke_one(architecture, config=config, splits_dir=args.splits_dir)
@@ -451,6 +578,7 @@ def main() -> None:
                 architecture, config=config, splits_dir=args.splits_dir,
                 outputs_dir=args.outputs_dir, batch_size=batch_size,
                 stage=args.stage, parent_run_id=args.parent_run_id,
+                optimizer_name=args.optimizer_choice,
             )
 
 
