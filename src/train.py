@@ -1,4 +1,4 @@
-"""Day 2 frozen-backbone baselines; explicit --smoke or --run required.
+"""Frozen-backbone comparisons; explicit --smoke or --run required.
 
 Examples (repository root):
     python -m src.train --architecture efficientnetb0 --smoke
@@ -19,11 +19,12 @@ import pandas as pd
 import tensorflow as tf
 from sklearn.metrics import f1_score
 
-from .data_pipeline import load_training_partitions, make_image_dataset
+from .augmentation import build_moderate_augmentation
+from .data_pipeline import load_training_partitions, make_image_dataset, preprocess_for
 from .evaluate import evaluate_validation
 from .models import ARCHITECTURES, build_frozen_classifier, parameter_counts
 from .utils import append_experiment_log, create_run_directory, runtime_info, save_json, set_seed
-from .visualization import plot_learning_curves
+from .visualization import plot_augmentation_pairs, plot_learning_curves
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "day2_frozen_no_aug.json"
 
@@ -32,14 +33,24 @@ def load_config(path: Path) -> dict:
     config = json.loads(Path(path).read_text(encoding="utf-8"))
     expected = {
         "seed": 42, "image_size": [224, 224], "pretrained_weights": "imagenet",
-        "backbone_trainable": False, "augmentation": False, "class_weights": False,
+        "backbone_trainable": False, "class_weights": False,
         "dropout": 0, "l2": 0, "head_units": 128, "optimizer": "adam",
         "learning_rate": 0.001, "loss": "sparse_categorical_crossentropy",
         "selection_metric": "val_macro_f1",
     }
     for key, value in expected.items():
         if config.get(key) != value:
-            raise ValueError(f"Day 2 config requires {key}={value!r}; got {config.get(key)!r}.")
+            raise ValueError(f"Frozen comparison requires {key}={value!r}; got {config.get(key)!r}.")
+    if config.get("augmentation") not in (True, False):
+        raise ValueError("augmentation must be true or false.")
+    if config["augmentation"]:
+        policy = {
+            "flips": "horizontal_and_vertical", "rotation_degrees": 20,
+            "zoom_fraction": 0.10, "brightness_fraction_of_255": 0.08,
+            "input_value_range": [0, 255],
+        }
+        if config.get("augmentation_policy") != policy:
+            raise ValueError("Day 3 augmentation policy differs from the shared moderate policy.")
     if not 1 <= int(config.get("max_epochs", 0)) <= 12:
         raise ValueError("max_epochs must be between 1 and 12.")
     if int(config.get("early_stopping_patience", -1)) != 3:
@@ -49,6 +60,23 @@ def load_config(path: Path) -> dict:
     if tuple(config.get("architectures", [])) != ARCHITECTURES:
         raise ValueError(f"Day 2 architecture list must be {ARCHITECTURES}.")
     return config
+
+
+def baseline_comparator(outputs_dir: Path, architecture: str, batch_size: int) -> str:
+    """Find the corresponding Day 2 run; augmented runs start from ImageNet."""
+    log_path = Path(outputs_dir) / "experiment_log.csv"
+    if not log_path.is_file():
+        raise FileNotFoundError(f"Day 2 experiment log is missing: {log_path}")
+    log = pd.read_csv(log_path)
+    matches = log[
+        (log["comparison_group"] == "day2_frozen_no_augmentation")
+        & (log["architecture"] == architecture)
+        & (log["batch_size"] == batch_size)
+        & (log["seed"] == 42)
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"Expected exactly one matched Day 2 {architecture} baseline; found {len(matches)}.")
+    return str(matches.iloc[0]["run_id"])
 
 
 class ValidationMacroF1(tf.keras.callbacks.Callback):
@@ -110,8 +138,9 @@ def baseline_callbacks(validation_ds: tf.data.Dataset, labels: np.ndarray, check
 def train_one(
     architecture: str, *, config: dict, splits_dir: Path, outputs_dir: Path, batch_size: int,
 ) -> tuple[str, dict]:
-    """Train one ImageNet frozen baseline and score only its best checkpoint."""
+    """Train one fresh ImageNet frozen model and score its best checkpoint."""
     train, validation, mapping = load_training_partitions(splits_dir)
+    comparator_run_id = baseline_comparator(outputs_dir, architecture, batch_size) if config["augmentation"] else None
     tf.keras.backend.clear_session()
     set_seed(config["seed"])
     model, backbone = build_frozen_classifier(
@@ -122,7 +151,11 @@ def train_one(
         raise AssertionError("Backbone is not fully frozen.")
     compile_baseline(model)
     counts = parameter_counts(model)
-    train_ds = make_image_dataset(train, training=True, batch_size=batch_size, architecture=architecture, seed=config["seed"])
+    augment = build_moderate_augmentation(config["seed"]) if config["augmentation"] else None
+    train_ds = make_image_dataset(
+        train, training=True, batch_size=batch_size, architecture=architecture,
+        augment=augment, seed=config["seed"],
+    )
     validation_ds = make_image_dataset(validation, training=False, batch_size=batch_size, architecture=architecture)
     assert_validation_order(validation_ds, validation["class_index"].to_numpy())
 
@@ -131,13 +164,20 @@ def train_one(
     run_config = {
         **config, "run_id": run_id, "architecture": architecture,
         "batch_size": batch_size, "parent_run_id": None,
-        "comparator": config["comparison_group"],
+        "comparator": comparator_run_id or config["comparison_group"],
+        "comparator_run_id": comparator_run_id,
         "splits_dir": str(Path(splits_dir).resolve()),
         "class_mapping": mapping,
         "preprocessing": "raw RGB 0-255 for EfficientNetB0; Keras preprocess_input once for MobileNetV2/ResNet50",
         "checkpoint_selection": "highest full-validation macro F1; first epoch wins ties",
     }
     save_json(run_config, run_dir / "config.json")
+    if augment is not None:
+        examples = train.groupby("class_index", sort=True, group_keys=False).head(1)
+        originals, example_labels = next(iter(make_image_dataset(examples, batch_size=7)))
+        montage_augment = build_moderate_augmentation(config["seed"])
+        changed = montage_augment(originals, training=True).numpy()
+        plot_augmentation_pairs(originals.numpy(), changed, example_labels.numpy(), run_dir / "augmentation_examples.png")
     callbacks, f1_callback = baseline_callbacks(
         validation_ds, validation["class_index"].to_numpy(dtype=int),
         checkpoint, config["early_stopping_patience"],
@@ -167,7 +207,8 @@ def train_one(
 
     runtime = runtime_info(batch_size)
     metrics = {
-        "run_id": run_id, "architecture": architecture, **scores,
+        "run_id": run_id, "architecture": architecture,
+        "augmentation": bool(config["augmentation"]), "comparator_run_id": comparator_run_id, **scores,
         "actual_epochs": len(f1_callback.scores), "best_epoch": best_epoch,
         "training_seconds": duration, **counts,
         "framework_versions": {key: runtime[key] for key in ("python", "tensorflow", "keras", "pandas", "numpy", "scikit_learn")},
@@ -179,8 +220,8 @@ def train_one(
     save_json(metrics, run_dir / "metrics.json")
     append_experiment_log(outputs_dir, {
         "run_id": run_id, "comparison_group": config["comparison_group"],
-        "parent_run_id": "", "architecture": architecture,
-        "augmentation": False, "class_weights": False,
+        "parent_run_id": "", "comparator_run_id": comparator_run_id or "", "architecture": architecture,
+        "augmentation": bool(config["augmentation"]), "class_weights": False,
         "dropout": 0, "l2": 0, "optimizer": "adam", "learning_rate": 1e-3,
         "batch_size": batch_size, "seed": config["seed"],
         "actual_epochs": metrics["actual_epochs"], "best_epoch": best_epoch,
@@ -209,9 +250,43 @@ def smoke_one(architecture: str, *, config: dict, splits_dir: Path) -> dict:
     if backbone.trainable or backbone.trainable_weights:
         raise AssertionError("Backbone is not fully frozen.")
     compile_baseline(model)
-    train_ds = make_image_dataset(train_small, training=True, batch_size=7, architecture=architecture)
+    augment = build_moderate_augmentation(config["seed"]) if config["augmentation"] else None
+    train_ds = make_image_dataset(
+        train_small, training=True, batch_size=7, architecture=architecture,
+        augment=augment, seed=config["seed"],
+    )
     validation_ds = make_image_dataset(validation_small, training=False, batch_size=7, architecture=architecture)
     assert_validation_order(validation_ds, validation_small["class_index"].to_numpy())
+    first_val, first_labels = next(iter(validation_ds))
+    second_val, second_labels = next(iter(validation_ds))
+    if not np.array_equal(first_val.numpy(), second_val.numpy()) or not np.array_equal(first_labels.numpy(), second_labels.numpy()):
+        raise AssertionError("Repeated validation loading is not deterministic.")
+    raw_val, _ = next(iter(make_image_dataset(validation_small, batch_size=7)))
+    expected_val = preprocess_for(architecture)(raw_val).numpy()
+    if not np.allclose(first_val.numpy(), expected_val, atol=1e-5):
+        raise AssertionError("Validation preprocessing differs from exactly one application transform.")
+    train_images, train_labels = next(iter(train_ds))
+    if train_images.shape != (7, 224, 224, 3) or set(train_labels.numpy()) != set(range(7)):
+        raise AssertionError("Training image shape or labels are invalid.")
+    if not np.isfinite(train_images.numpy()).all():
+        raise AssertionError("Training pixels contain nonfinite values.")
+    limits = {
+        "efficientnetb0": (0, 255),
+        "mobilenetv2": (-1, 1),
+        "resnet50": (-123.68, 151.061),
+    }
+    lower, upper = limits[architecture]
+    if float(tf.reduce_min(train_images)) < lower - 1e-4 or float(tf.reduce_max(train_images)) > upper + 1e-4:
+        raise AssertionError(f"{architecture} preprocessed training pixels are outside [{lower}, {upper}].")
+    augmented_raw_range = None
+    if augment is not None:
+        raw_augmented, _ = next(iter(make_image_dataset(
+            train_small, training=True, batch_size=7,
+            augment=build_moderate_augmentation(config["seed"]), seed=config["seed"],
+        )))
+        augmented_raw_range = [float(tf.reduce_min(raw_augmented)), float(tf.reduce_max(raw_augmented))]
+        if augmented_raw_range[0] < 0 or augmented_raw_range[1] > 255:
+            raise AssertionError("Augmented raw pixels left [0, 255].")
     with tempfile.TemporaryDirectory(prefix="ham_day2_smoke_") as temporary:
         checkpoint = Path(temporary) / "best.keras"
         callbacks, f1_callback = baseline_callbacks(
@@ -229,10 +304,15 @@ def smoke_one(architecture: str, *, config: dict, splits_dir: Path) -> dict:
             raise AssertionError(f"Checkpoint reload difference too large: {difference}")
     result = {
         "architecture": architecture, "smoke_only": True,
+        "augmentation": bool(config["augmentation"]),
         "pretrained_weights": None, "training_images": len(train_small),
         "validation_images": len(validation_small), "one_epoch_loss": loss,
         "val_macro_f1_pipeline_check": f1_callback.scores[0],
         "checkpoint_reload_max_probability_difference": difference,
+        "train_batch_shape": list(train_images.shape),
+        "train_preprocessed_pixel_range": [float(tf.reduce_min(train_images)), float(tf.reduce_max(train_images))],
+        "augmented_raw_pixel_range": augmented_raw_range,
+        "validation_repeated_identical": True,
         **parameter_counts(model), "backbone_frozen": True,
     }
     print(json.dumps(result, indent=2))
@@ -246,7 +326,7 @@ def main() -> None:
     architecture_group.add_argument("--all", action="store_true", help="Run all three architectures sequentially")
     action_group = parser.add_mutually_exclusive_group(required=True)
     action_group.add_argument("--smoke", action="store_true", help="Tiny random-weight pipeline and checkpoint check")
-    action_group.add_argument("--run", action="store_true", help="Start full ImageNet baseline training")
+    action_group.add_argument("--run", action="store_true", help="Start full ImageNet frozen training")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--splits-dir", type=Path, default=Path("day1_artifacts"))
     parser.add_argument("--outputs-dir", type=Path, default=Path("outputs"))

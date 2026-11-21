@@ -187,6 +187,32 @@ The runner never starts full training without `--run`. It reads the existing `tr
 
 Each `outputs/runs/<run_id>/` contains `config.json`, `best.keras`, `history.csv`, `validation_predictions.csv`, `metrics.json`, and `learning_curves.png`. The validation metrics and probabilities come from `best.keras`. `outputs/experiment_log.csv` has one row per completed run. Run IDs are unique and existing run directories are never replaced. Training requires ImageNet weight downloads on first use. This Windows environment currently detects no TensorFlow GPU, so full runs may be slow locally; Kaggle GPU is an option. Keep test predictions and scores closed until model choices are final.
 
+## Day 3: Moderate augmentation
+
+Day 3 reuses the saved train/validation splits and class mapping. It starts each frozen backbone from ImageNet weights with the same seeded head initialization as Day 2. Training-only augmentation applies horizontal and vertical flips, rotations within ±20 degrees, zoom within approximately ±10%, and brightness within ±20.4 raw pixel levels. Augmentation acts on RGB pixels in `[0, 255]` before each model's preprocessing. Validation stays deterministic. Inspect each run's `augmentation_examples.png` for lesion visibility.
+
+First run a tiny pipeline and checkpoint check (replace the architecture to check the others):
+
+```powershell
+python -m src.train --architecture efficientnetb0 --smoke --config .\configs\day3_frozen_aug.json --splits-dir .\day1_artifacts
+```
+
+Run the three full jobs **sequentially** on the local CPU:
+
+```powershell
+python -m src.train --architecture efficientnetb0 --run --config .\configs\day3_frozen_aug.json --splits-dir .\day1_artifacts --outputs-dir .\outputs
+python -m src.train --architecture mobilenetv2 --run --config .\configs\day3_frozen_aug.json --splits-dir .\day1_artifacts --outputs-dir .\outputs
+python -m src.train --architecture resnet50 --run --config .\configs\day3_frozen_aug.json --splits-dir .\day1_artifacts --outputs-dir .\outputs
+```
+
+Each run writes a new folder under `outputs/runs/` with configuration, montage, best checkpoint, history, validation probabilities, metrics, and learning curves. Day 2 outputs are preserved. When all three augmented runs are complete, generate the six-run validation table and score changes:
+
+```powershell
+python -m src.compare --outputs-dir .\outputs
+```
+
+The command writes `day3_six_run_comparison.csv` and `day3_augmentation_changes.csv` under `outputs/`. A change is augmented minus baseline; multiply by 100 for percentage points. The command requires one completed run per configuration and never opens test data.
+
 ## Data Splitting and Leakage Prevention
 
 Target partition sizes:
@@ -491,13 +517,13 @@ Adam’s internal mechanisms are explained rather than presented as separately t
 
 ## Results
 
-Experiments have not been reported yet. Replace the placeholders below with measured results.
+The three Day 2 frozen, unaugmented baselines are measured. Fill the augmentation column after the Day 3 runs; test results remain closed.
 
 | Architecture   | Val macro F1: no augmentation | Val macro F1: augmentation |
 | -------------- | ----------------------------: | -------------------------: |
-| MobileNetV2    |                       Pending |                    Pending |
-| EfficientNetB0 |                       Pending |                    Pending |
-| ResNet50       |                       Pending |                    Pending |
+| MobileNetV2    |                        0.5557 |                    Pending |
+| EfficientNetB0 |                        0.6201 |                    Pending |
+| ResNet50       |                        0.5443 |                    Pending |
 
 | Model                | Test accuracy | Test macro F1 | Test balanced accuracy |
 | -------------------- | ------------: | ------------: | ---------------------: |
