@@ -1,0 +1,19 @@
+# Local environments and Python caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Dataset copies and generated experiment artifacts
+data/
+day1_artifacts/
+outputs/
+*.keras
+*.h5
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example

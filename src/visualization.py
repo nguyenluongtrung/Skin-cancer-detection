@@ -1,0 +1,59 @@
+"""Small, reusable Day 1 plots; no plotting runs during import."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")  # Save figures without a display server.
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from PIL import Image, UnidentifiedImageError
+
+CLASSES = ("akiec", "bcc", "bkl", "df", "mel", "nv", "vasc")
+
+
+def plot_dataset_overview(frame: pd.DataFrame, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    counts = frame["dx"].value_counts().reindex(CLASSES, fill_value=0)
+    lesions = frame.drop_duplicates("lesion_id")["dx"].value_counts().reindex(CLASSES, fill_value=0)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+    sns.barplot(x=counts.index, y=counts.values, ax=axes[0], color="steelblue")
+    axes[0].set(title="Images by diagnosis", xlabel="dx", ylabel="Images")
+    sns.barplot(x=lesions.index, y=lesions.values, ax=axes[1], color="darkseagreen")
+    axes[1].set(title="Lesions by diagnosis", xlabel="dx", ylabel="Lesions")
+    fig.tight_layout()
+    fig.savefig(output_dir / "class_distribution.png", dpi=150)
+    plt.close(fig)
+
+    valid = frame.dropna(subset=["image_path", "dx"])
+    selected = valid.groupby("dx", group_keys=False).head(2)
+    fig, axes = plt.subplots(2, 7, figsize=(15, 5))
+    for ax in axes.flat:
+        ax.axis("off")
+    for col, diagnosis in enumerate(CLASSES):
+        for row_index, (_, row) in enumerate(selected[selected["dx"] == diagnosis].head(2).iterrows()):
+            try:
+                with Image.open(row["image_path"]) as image:
+                    axes[row_index, col].imshow(image.convert("RGB"))
+                axes[row_index, col].set_title(f"{diagnosis}: {row['image_id']}", fontsize=8)
+            except (OSError, ValueError, UnidentifiedImageError):
+                axes[row_index, col].set_title(f"Unreadable: {diagnosis}", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output_dir / "sample_images.png", dpi=150)
+    plt.close(fig)
+
+
+def plot_first_batch(images: np.ndarray, labels: np.ndarray, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(2, 4, figsize=(10, 5))
+    for i, ax in enumerate(axes.flat):
+        if i < len(images):
+            ax.imshow(images[i].astype(np.uint8))
+            ax.set_title(f"class index {int(labels[i])}")
+        ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(output_dir / "first_batch.png", dpi=150)
+    plt.close(fig)
