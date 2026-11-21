@@ -86,3 +86,27 @@ def append_experiment_log(outputs_dir: Path, row: dict) -> None:
         writer.writerows(existing)
         writer.writerow(row)
     temporary.replace(path)
+
+
+def invalidate_experiment(outputs_dir: Path, run_id: str, reason: str) -> None:
+    """Retain a flawed run while excluding it from staged decisions."""
+    outputs_dir = Path(outputs_dir).expanduser().resolve()
+    path = outputs_dir / "experiment_log.csv"
+    with path.open("r", newline="", encoding="utf-8") as source:
+        reader = csv.DictReader(source)
+        columns = list(reader.fieldnames or [])
+        rows = list(reader)
+    matches = [row for row in rows if row["run_id"] == run_id]
+    if len(matches) != 1:
+        raise ValueError(f"Expected exactly one logged run {run_id!r}.")
+    if "run_status" not in columns:
+        columns.append("run_status")
+    matches[0]["run_status"] = "invalid"
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as target:
+        writer = csv.DictWriter(target, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+    temporary.replace(path)
+    save_json({"run_id": run_id, "status": "invalid", "reason": reason},
+              outputs_dir / "runs" / run_id / "invalidated.json")

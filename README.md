@@ -517,13 +517,56 @@ Adam’s internal mechanisms are explained rather than presented as separately t
 
 ## Results
 
-The three Day 2 frozen, unaugmented baselines are measured. Fill the augmentation column after the Day 3 runs; test results remain closed.
+The six Day 2 and Day 3 frozen runs are measured. EfficientNetB0 without augmentation is selected for Day 4; test results remain closed.
 
 | Architecture   | Val macro F1: no augmentation | Val macro F1: augmentation |
 | -------------- | ----------------------------: | -------------------------: |
-| MobileNetV2    |                        0.5557 |                    Pending |
-| EfficientNetB0 |                        0.6201 |                    Pending |
-| ResNet50       |                        0.5443 |                    Pending |
+| MobileNetV2    |                        0.5557 |                   0.5087 |
+| EfficientNetB0 |                        0.6201 |                   0.5640 |
+| ResNet50       |                        0.5443 |                   0.5565 |
+
+### Day 4: staged head experiments
+
+From the repository root, run only the class-weighting stage first:
+
+```powershell
+.venv\Scripts\python.exe -m src.train --stage T2_E0_CW --config configs/frozen_head_experiments.json --run
+```
+
+Inspect `outputs/day4_comparison.csv`, `outputs/day4_baseline_vs_weighted_per_class.csv`, and `outputs/day4_decisions.json`. The decision file names the validation-selected run. Supply that ID to the dropout stage only after reviewing the first result:
+
+```powershell
+.venv\Scripts\python.exe -m src.train --stage T3_E0_D --config configs/frozen_head_experiments.json --parent-run-id SELECTED_RUN_ID --run
+```
+
+After reviewing dropout, use its selected run ID for L2:
+
+```powershell
+.venv\Scripts\python.exe -m src.train --stage T3_E0_L --config configs/frozen_head_experiments.json --parent-run-id SELECTED_RUN_ID --run
+```
+
+Each stage starts from fresh ImageNet weights with the same seeded head initialization and the fixed train/validation split. Class weights come only from training labels and affect only training loss. Validation macro F1 is computed over all validation images in fixed class order and selects the saved best checkpoint. The runner permits one logged run per stage and rejects an unselected parent. Run folders contain configuration, checkpoint, history, validation probabilities and predictions, metrics, runtime, and curves. The comparison CSV records changes from each stage's exact parent; strictly higher validation macro F1 means keep, and ties mean reject. Keras logged loss includes the L2 term when enabled, and weighted and regularized losses are not directly comparable with baseline loss.
+
+Class weighting (`T2_E0_CW`) completed with best-checkpoint validation macro F1 **0.567180** at epoch 8, compared with **0.620086** for the unweighted baseline (change **-0.052907**). Decision: **reject class weights**. The selected parent for dropout was `20261121T040611579432Z_efficientnetb0_edeb0f80`. Its command was:
+
+```powershell
+.venv\Scripts\python.exe -m src.train --stage T3_E0_D --config configs/frozen_head_experiments.json --parent-run-id 20261121T040611579432Z_efficientnetb0_edeb0f80 --run
+```
+
+The first dropout run (`20261121T124732150308Z_t3_e0_d_6357e54a`) was invalidated: its Functional graph held head dropout in inference mode, giving identical histories and validation probabilities to the baseline. Its files are retained with `invalidated.json`, and its experiment-log row has `run_status=invalid`. After fixing the training-mode call and verifying checkpoint reload, the valid dropout run (`20261121T132354369564Z_t3_e0_d_05eea9d1`) reached best-checkpoint validation macro F1 **0.572482** at epoch 4, a change of **-0.047604** from the baseline. Decision: **reject dropout**. The selected parent for L2 was the unweighted, no-dropout baseline. Its command was:
+
+```powershell
+.venv\Scripts\python.exe -m src.train --stage T3_E0_L --config configs/frozen_head_experiments.json --parent-run-id 20261121T040611579432Z_efficientnetb0_edeb0f80 --run
+```
+
+L2 (`T3_E0_L`) completed with best-checkpoint validation macro F1 **0.621915** at epoch 12, compared with **0.620086** for the identical recipe without L2 (change **+0.001829**). Decision: **keep L2** under the predefined strict macro-F1 rule. The selected run is `20261121T134510640652Z_t3_e0_l_e8ee6a73`: EfficientNetB0 frozen, no augmentation, no class weighting, no dropout, and L2 coefficient `0.0001` on the hidden Dense layer. The gain is small, and validation accuracy (0.798043 versus 0.799441) and balanced accuracy (0.604547 versus 0.613682) decreased. Logged L2 loss includes the regularization penalty, so compare validation metrics rather than loss values across these runs.
+
+| Modification | Best validation macro F1 | Change from matching parent | Decision |
+| --- | ---: | ---: | --- |
+| Baseline | 0.620086 | — | Parent |
+| Class weights | 0.567180 | -0.052907 | Reject |
+| Dropout 0.3 | 0.572482 | -0.047604 | Reject |
+| L2 0.0001 | 0.621915 | +0.001829 | Keep |
 
 | Model                | Test accuracy | Test macro F1 | Test balanced accuracy |
 | -------------------- | ------------: | ------------: | ---------------------: |
