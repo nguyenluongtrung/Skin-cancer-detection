@@ -20,6 +20,7 @@ import tensorflow as tf
 from sklearn.metrics import f1_score
 
 from .augmentation import build_moderate_augmentation
+from .compare import HEAD_EXPERIMENT_STAGES, write_head_experiment_comparisons
 from .data_pipeline import load_training_partitions, make_image_dataset, preprocess_for
 from .evaluate import evaluate_validation
 from .models import ARCHITECTURES, build_frozen_classifier, parameter_counts
@@ -27,6 +28,7 @@ from .utils import append_experiment_log, create_run_directory, runtime_info, sa
 from .visualization import plot_augmentation_pairs, plot_learning_curves
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "day2_frozen_no_aug.json"
+HEAD_EXPERIMENT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "frozen_head_experiments.json"
 
 
 def load_config(path: Path) -> dict:
@@ -77,6 +79,81 @@ def baseline_comparator(outputs_dir: Path, architecture: str, batch_size: int) -
     if len(matches) != 1:
         raise ValueError(f"Expected exactly one matched Day 2 {architecture} baseline; found {len(matches)}.")
     return str(matches.iloc[0]["run_id"])
+
+
+def load_head_experiment_config(path: Path) -> dict:
+    """Keep the selected frozen recipe fixed across head experiments."""
+    config = json.loads(path.read_text(encoding="utf-8"))
+    baseline = load_config(DEFAULT_CONFIG)
+    for key in ("seed", "image_size", "batch_size", "max_epochs", "early_stopping_patience",
+                "pretrained_weights", "backbone_trainable", "augmentation", "head_units",
+                "optimizer", "learning_rate", "loss", "selection_metric"):
+        if config.get(key) != baseline[key]:
+            raise ValueError(f"Head experiments must retain baseline {key}={baseline[key]!r}.")
+    if config.get("architecture") != "efficientnetb0":
+        raise ValueError("Selected architecture must be efficientnetb0.")
+    return config
+
+
+def training_class_weights(train: pd.DataFrame, mapping: dict[str, int]) -> dict[int, float]:
+    """Calculate inverse-frequency weights from saved training integer labels."""
+    counts = train["class_index"].value_counts()
+    expected = set(mapping.values())
+    if set(counts.index) != expected:
+        raise ValueError("Every mapped class must occur in training labels.")
+    return {int(index): len(train) / (len(mapping) * int(counts[index])) for index in sorted(expected)}
+
+
+def logged_run(outputs_dir: Path, run_id: str) -> tuple[dict, dict, dict]:
+    log = pd.read_csv(outputs_dir / "experiment_log.csv")
+    rows = log.loc[log.run_id == run_id]
+    if len(rows) != 1:
+        raise ValueError(f"Expected exactly one logged run {run_id!r}.")
+    directory = outputs_dir / "runs" / run_id
+    return (rows.iloc[0].to_dict(),
+            json.loads((directory / "config.json").read_text(encoding="utf-8")),
+            json.loads((directory / "metrics.json").read_text(encoding="utf-8")))
+
+
+def valid_stage_rows(log: pd.DataFrame, stage: str) -> pd.DataFrame:
+    """Exclude runs invalidated by a verified implementation error."""
+    rows = log.loc[log.comparison_group == stage]
+    if "run_status" in rows:
+        rows = rows.loc[rows.run_status.fillna("valid") != "invalid"]
+    return rows
+
+
+def select_head_experiment_parent(stage: str, outputs_dir: Path, requested: str | None, baseline_id: str) -> tuple[str, bool, float, float]:
+    """Use the validation winner from the immediately preceding comparison."""
+    if stage == HEAD_EXPERIMENT_STAGES[0]:
+        if requested:
+            raise ValueError("Class weighting uses the fixed baseline; omit --parent-run-id.")
+        return baseline_id, True, 0.0, 0.0
+    if not requested:
+        raise ValueError("Later stages require --parent-run-id from the preceding comparison.")
+    row, config, _ = logged_run(outputs_dir, requested)
+    if row["architecture"] != "efficientnetb0" or str(row["augmentation"]).lower() != "false":
+        raise ValueError("Parent must be an unaugmented EfficientNetB0 run.")
+    log = pd.read_csv(outputs_dir / "experiment_log.csv")
+    if stage == HEAD_EXPERIMENT_STAGES[1]:
+        weighted = valid_stage_rows(log, HEAD_EXPERIMENT_STAGES[0])
+        if len(weighted) != 1:
+            raise ValueError("Run class weighting exactly once before dropout.")
+        winner = max((baseline_id, str(weighted.iloc[0].run_id)),
+                     key=lambda run: logged_run(outputs_dir, run)[2]["validation_macro_f1"])
+        if requested != winner:
+            raise ValueError(f"Dropout parent must be selected winner {winner}.")
+        return requested, bool(config.get("class_weights", False)), 0.3, 0.0
+    dropout = valid_stage_rows(log, HEAD_EXPERIMENT_STAGES[1])
+    if len(dropout) != 1:
+        raise ValueError("Run dropout exactly once before L2.")
+    dropout_id = str(dropout.iloc[0].run_id)
+    prior_id = str(dropout.iloc[0].parent_run_id)
+    winner = max((prior_id, dropout_id),
+                 key=lambda run: logged_run(outputs_dir, run)[2]["validation_macro_f1"])
+    if requested != winner:
+        raise ValueError(f"L2 parent must be selected winner {winner}.")
+    return requested, bool(config.get("class_weights", False)), float(config.get("dropout", 0)), 1e-4
 
 
 class ValidationMacroF1(tf.keras.callbacks.Callback):
@@ -137,15 +214,30 @@ def baseline_callbacks(validation_ds: tf.data.Dataset, labels: np.ndarray, check
 
 def train_one(
     architecture: str, *, config: dict, splits_dir: Path, outputs_dir: Path, batch_size: int,
+    stage: str | None = None, parent_run_id: str | None = None,
 ) -> tuple[str, dict]:
     """Train one fresh ImageNet frozen model and score its best checkpoint."""
     train, validation, mapping = load_training_partitions(splits_dir)
-    comparator_run_id = baseline_comparator(outputs_dir, architecture, batch_size) if config["augmentation"] else None
+    if stage:
+        baseline_id = baseline_comparator(outputs_dir, architecture, batch_size)
+        parent_id, use_weights, dropout, l2 = select_head_experiment_parent(stage, outputs_dir, parent_run_id, baseline_id)
+        if not valid_stage_rows(pd.read_csv(outputs_dir / "experiment_log.csv"), stage).empty:
+            raise ValueError(f"{stage} already completed; existing outputs will not be overwritten.")
+        _, parent_config, _ = logged_run(outputs_dir, parent_id)
+        for key in ("seed", "image_size", "batch_size", "max_epochs", "early_stopping_patience",
+                    "pretrained_weights", "backbone_trainable", "augmentation", "head_units",
+                    "optimizer", "learning_rate", "loss", "selection_metric"):
+            if parent_config[key] != config[key]:
+                raise ValueError(f"Parent differs from head experiment configuration on {key}.")
+    else:
+        parent_id, use_weights, dropout, l2 = None, False, 0.0, 0.0
+    comparator_run_id = parent_id if stage else (baseline_comparator(outputs_dir, architecture, batch_size) if config["augmentation"] else None)
+    class_weights = training_class_weights(train, mapping) if use_weights else None
     tf.keras.backend.clear_session()
     set_seed(config["seed"])
     model, backbone = build_frozen_classifier(
         architecture, num_classes=len(mapping), image_size=tuple(config["image_size"]),
-        weights="imagenet", seed=config["seed"],
+        weights="imagenet", seed=config["seed"], dropout=dropout, l2=l2,
     )
     if backbone.trainable or backbone.trainable_weights:
         raise AssertionError("Backbone is not fully frozen.")
@@ -159,17 +251,20 @@ def train_one(
     validation_ds = make_image_dataset(validation, training=False, batch_size=batch_size, architecture=architecture)
     assert_validation_order(validation_ds, validation["class_index"].to_numpy())
 
-    run_id, run_dir = create_run_directory(outputs_dir, architecture)
+    run_id, run_dir = create_run_directory(outputs_dir, stage.lower() if stage else architecture)
     checkpoint = run_dir / "best.keras"
     run_config = {
         **config, "run_id": run_id, "architecture": architecture,
-        "batch_size": batch_size, "parent_run_id": None,
+        "batch_size": batch_size, "parent_run_id": parent_id,
         "comparator": comparator_run_id or config["comparison_group"],
         "comparator_run_id": comparator_run_id,
         "splits_dir": str(Path(splits_dir).resolve()),
         "class_mapping": mapping,
         "preprocessing": "raw RGB 0-255 for EfficientNetB0; Keras preprocess_input once for MobileNetV2/ResNet50",
         "checkpoint_selection": "highest full-validation macro F1; first epoch wins ties",
+        "stage": stage, "class_weights": use_weights, "class_weight_values": class_weights,
+        "dropout": dropout, "l2": l2,
+        "loss_note": "Logged loss includes L2 when enabled; class weights apply to training loss only. Validation metrics are unweighted. Losses across different objectives are not directly comparable.",
     }
     save_json(run_config, run_dir / "config.json")
     if augment is not None:
@@ -185,7 +280,7 @@ def train_one(
     started = time.perf_counter()
     history = model.fit(
         train_ds, validation_data=validation_ds, epochs=config["max_epochs"],
-        callbacks=callbacks, verbose=2,
+        callbacks=callbacks, class_weight=class_weights, verbose=2,
     )
     duration = time.perf_counter() - started
     if not checkpoint.is_file():
@@ -216,13 +311,15 @@ def train_one(
         "visible_gpus": runtime["gpus"],
         "best_checkpoint": str(checkpoint),
         "validation_images": len(validation),
+        "stage": stage, "parent_run_id": parent_id, "class_weight_values": class_weights,
+        "logged_loss_includes_l2": bool(l2),
     }
     save_json(metrics, run_dir / "metrics.json")
     append_experiment_log(outputs_dir, {
-        "run_id": run_id, "comparison_group": config["comparison_group"],
-        "parent_run_id": "", "comparator_run_id": comparator_run_id or "", "architecture": architecture,
-        "augmentation": bool(config["augmentation"]), "class_weights": False,
-        "dropout": 0, "l2": 0, "optimizer": "adam", "learning_rate": 1e-3,
+        "run_id": run_id, "comparison_group": stage or config["comparison_group"],
+        "parent_run_id": parent_id or "", "comparator_run_id": comparator_run_id or "", "architecture": architecture,
+        "augmentation": bool(config["augmentation"]), "class_weights": use_weights,
+        "dropout": dropout, "l2": l2, "optimizer": "adam", "learning_rate": 1e-3,
         "batch_size": batch_size, "seed": config["seed"],
         "actual_epochs": metrics["actual_epochs"], "best_epoch": best_epoch,
         "validation_accuracy": scores["validation_accuracy"],
@@ -231,7 +328,11 @@ def train_one(
         "training_seconds": duration, **counts,
         "detected_training_device": metrics["detected_training_device"],
         "run_dir": str(run_dir),
+        "logged_loss_includes_l2": bool(l2),
+        "run_status": "valid",
     })
+    if stage:
+        write_head_experiment_comparisons(outputs_dir, mapping)
     print(f"Saved run {run_id}: best epoch {best_epoch}, validation macro F1 {scores['validation_macro_f1']:.4f}")
     return run_id, metrics
 
@@ -324,6 +425,7 @@ def main() -> None:
     architecture_group = parser.add_mutually_exclusive_group(required=True)
     architecture_group.add_argument("--architecture", choices=ARCHITECTURES)
     architecture_group.add_argument("--all", action="store_true", help="Run all three architectures sequentially")
+    architecture_group.add_argument("--stage", choices=HEAD_EXPERIMENT_STAGES, help="Run one sequential head experiment")
     action_group = parser.add_mutually_exclusive_group(required=True)
     action_group.add_argument("--smoke", action="store_true", help="Tiny random-weight pipeline and checkpoint check")
     action_group.add_argument("--run", action="store_true", help="Start full ImageNet frozen training")
@@ -331,10 +433,16 @@ def main() -> None:
     parser.add_argument("--splits-dir", type=Path, default=Path("day1_artifacts"))
     parser.add_argument("--outputs-dir", type=Path, default=Path("outputs"))
     parser.add_argument("--batch-size", type=int, choices=(16, 32), help="Override the shared configured batch size")
+    parser.add_argument("--parent-run-id", help="Validation-selected parent for dropout or L2")
     args = parser.parse_args()
-    config = load_config(args.config)
+    if args.stage and (args.smoke or args.batch_size):
+        parser.error("Head experiments require --run and the fixed configured batch size.")
+    if args.parent_run_id and not args.stage:
+        parser.error("--parent-run-id is only for head experiments.")
+    config_path = HEAD_EXPERIMENT_CONFIG if args.stage and args.config == DEFAULT_CONFIG else args.config
+    config = load_head_experiment_config(config_path) if args.stage else load_config(config_path)
     batch_size = args.batch_size or config["batch_size"]
-    architectures = config["architectures"] if args.all else [args.architecture]
+    architectures = config["architectures"] if args.all else [config["architecture"] if args.stage else args.architecture]
     for architecture in architectures:
         if args.smoke:
             smoke_one(architecture, config=config, splits_dir=args.splits_dir)
@@ -342,6 +450,7 @@ def main() -> None:
             train_one(
                 architecture, config=config, splits_dir=args.splits_dir,
                 outputs_dir=args.outputs_dir, batch_size=batch_size,
+                stage=args.stage, parent_run_id=args.parent_run_id,
             )
 
 

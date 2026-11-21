@@ -1,0 +1,17 @@
+{
+  "comparison_group": "frozen_head_experiments",
+  "architecture": "efficientnetb0",
+  "seed": 42,
+  "image_size": [224, 224],
+  "batch_size": 32,
+  "max_epochs": 12,
+  "early_stopping_patience": 3,
+  "pretrained_weights": "imagenet",
+  "backbone_trainable": false,
+  "augmentation": false,
+  "head_units": 128,
+  "optimizer": "adam",
+  "learning_rate": 0.001,
+  "loss": "sparse_categorical_crossentropy",
+  "selection_metric": "val_macro_f1"
+}
