@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import platform
+import csv
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import matplotlib
@@ -44,3 +47,42 @@ def runtime_info(batch_size: int) -> dict:
         "seed": SEED,
         "batch_size": batch_size,
     }
+
+
+def create_run_directory(outputs_dir: Path, architecture: str) -> tuple[str, Path]:
+    """Create a unique run folder without overwriting an existing experiment."""
+    runs_dir = Path(outputs_dir).expanduser().resolve() / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    for _ in range(10):
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        run_id = f"{stamp}_{architecture.lower()}_{uuid.uuid4().hex[:8]}"
+        run_dir = runs_dir / run_id
+        try:
+            run_dir.mkdir(exist_ok=False)
+            return run_id, run_dir
+        except FileExistsError:
+            continue
+    raise FileExistsError("Could not create a unique run directory.")
+
+
+def append_experiment_log(outputs_dir: Path, row: dict) -> None:
+    """Append one complete run, preserving the log's existing column order."""
+    path = Path(outputs_dir).expanduser().resolve() / "experiment_log.csv"
+    if path.exists():
+        with path.open("r", newline="", encoding="utf-8") as source:
+            reader = csv.DictReader(source)
+            columns = list(reader.fieldnames or [])
+            existing = list(reader)
+        if any(previous.get("run_id") == row["run_id"] for previous in existing):
+            raise ValueError(f"Run ID already logged: {row['run_id']}")
+        columns.extend(key for key in row if key not in columns)
+    else:
+        columns = list(row)
+        existing = []
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as target:
+        writer = csv.DictWriter(target, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(existing)
+        writer.writerow(row)
+    temporary.replace(path)

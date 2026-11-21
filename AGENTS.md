@@ -2,11 +2,11 @@
 
 ## Project Structure & Module Organization
 
-`src/prepare_data.py` discovers HAM10000 metadata and JPEGs, audits records, and creates or verifies fixed lesion-grouped splits. `src/data_pipeline.py` handles RGB decoding, resizing, model-specific preprocessing, dataset construction, and the Day 1 smoke check. Shared seed and JSON helpers live in `src/utils.py`; plotting lives in `src/visualization.py`. `notebooks/01_eda.ipynb` imports these modules for exploration. `scripts/download_ham10000_isic.py` downloads the official ISIC release and builds the required metadata CSV. Generated data and artifacts are ignored by Git. The README describes later work, but experiment modules do not exist yet.
+`src/prepare_data.py` audits HAM10000 and manages fixed lesion-grouped splits. `src/data_pipeline.py` handles RGB decoding, resizing, model-specific preprocessing, and datasets. `src/models.py` builds frozen ImageNet classifiers; `src/train.py` runs Day 2 baselines; `src/evaluate.py` scores validation predictions. Shared helpers and plots live in `src/utils.py` and `src/visualization.py`. `notebooks/01_eda.ipynb` imports these modules. `scripts/download_ham10000_isic.py` downloads the official ISIC release. Generated `data/`, `day1_artifacts/`, and `outputs/` are ignored by Git.
 
 ## Build, Test, and Development Commands
 
-Install dependencies with `python -m pip install -r requirements.txt`. If needed, run `python -m scripts.download_ham10000_isic --output-dir data`; this downloads about 2.58 GiB and records provenance. Then run `python -m src.prepare_data --input-root data --output-dir day1_artifacts` to audit and split, followed by `python -m src.data_pipeline --output-dir day1_artifacts --batch-size 32` for the one-batch save/reload check. On Kaggle, set `--input-root /kaggle/input` and output under `/kaggle/working/`. Run synthetic checks with `python -m unittest discover -s tests -v`. There is no build step.
+Install dependencies with `python -m pip install -r requirements.txt`. If needed, download data with `python -m scripts.download_ham10000_isic --output-dir data`. Run the Day 2 pipeline check with `python -m src.train --architecture efficientnetb0 --smoke`; explicitly start one baseline with `python -m src.train --architecture efficientnetb0 --run`. Run all three sequentially with `python -m src.train --all --run`. Commands read saved splits in `day1_artifacts/` and write completed runs to `outputs/`. Run tests with `python -m unittest discover -s tests -v`. There is no build step.
 
 ## Coding Style & Naming Conventions
 

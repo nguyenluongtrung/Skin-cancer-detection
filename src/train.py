@@ -1,0 +1,269 @@
+"""Day 2 frozen-backbone baselines; explicit --smoke or --run required.
+
+Examples (repository root):
+    python -m src.train --architecture efficientnetb0 --smoke
+    python -m src.train --architecture efficientnetb0 --run
+    python -m src.train --all --run
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import tempfile
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from sklearn.metrics import f1_score
+
+from .data_pipeline import load_training_partitions, make_image_dataset
+from .evaluate import evaluate_validation
+from .models import ARCHITECTURES, build_frozen_classifier, parameter_counts
+from .utils import append_experiment_log, create_run_directory, runtime_info, save_json, set_seed
+from .visualization import plot_learning_curves
+
+DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "day2_frozen_no_aug.json"
+
+
+def load_config(path: Path) -> dict:
+    config = json.loads(Path(path).read_text(encoding="utf-8"))
+    expected = {
+        "seed": 42, "image_size": [224, 224], "pretrained_weights": "imagenet",
+        "backbone_trainable": False, "augmentation": False, "class_weights": False,
+        "dropout": 0, "l2": 0, "head_units": 128, "optimizer": "adam",
+        "learning_rate": 0.001, "loss": "sparse_categorical_crossentropy",
+        "selection_metric": "val_macro_f1",
+    }
+    for key, value in expected.items():
+        if config.get(key) != value:
+            raise ValueError(f"Day 2 config requires {key}={value!r}; got {config.get(key)!r}.")
+    if not 1 <= int(config.get("max_epochs", 0)) <= 12:
+        raise ValueError("max_epochs must be between 1 and 12.")
+    if int(config.get("early_stopping_patience", -1)) != 3:
+        raise ValueError("Day 2 early stopping patience must be 3.")
+    if int(config.get("batch_size", 0)) not in (16, 32):
+        raise ValueError("Day 2 batch size must be 16 or 32.")
+    if tuple(config.get("architectures", [])) != ARCHITECTURES:
+        raise ValueError(f"Day 2 architecture list must be {ARCHITECTURES}.")
+    return config
+
+
+class ValidationMacroF1(tf.keras.callbacks.Callback):
+    """Compute full-validation macro F1 before checkpoint and early stopping."""
+
+    def __init__(self, validation_ds: tf.data.Dataset, labels: np.ndarray, num_classes: int):
+        super().__init__()
+        self.validation_ds = validation_ds
+        self.labels = np.asarray(labels, dtype=int)
+        self.num_classes = num_classes
+        self.scores: list[float] = []
+        self.learning_rates: list[float] = []
+
+    def on_epoch_end(self, epoch: int, logs: dict | None = None) -> None:
+        if logs is None:
+            raise AssertionError("Keras did not provide epoch logs.")
+        probabilities = self.model.predict(self.validation_ds, verbose=0)
+        if probabilities.shape != (len(self.labels), self.num_classes):
+            raise AssertionError("Validation prediction count or class dimension changed.")
+        score = float(f1_score(
+            self.labels, probabilities.argmax(axis=1),
+            labels=list(range(self.num_classes)), average="macro", zero_division=0,
+        ))
+        learning_rate = float(tf.keras.backend.get_value(self.model.optimizer.learning_rate))
+        logs["val_macro_f1"] = score
+        logs["learning_rate"] = learning_rate
+        self.scores.append(score)
+        self.learning_rates.append(learning_rate)
+        print(f"epoch {epoch + 1}: val_macro_f1={score:.4f}, lr={learning_rate:g}", flush=True)
+
+
+def assert_validation_order(validation_ds: tf.data.Dataset, expected: np.ndarray) -> None:
+    """Catch shuffled or reordered validation datasets before scoring."""
+    observed = np.concatenate([labels.numpy() for _, labels in validation_ds])
+    if not np.array_equal(observed, np.asarray(expected, dtype=int)):
+        raise AssertionError("Validation dataset label order differs from validation.csv.")
+
+
+def compile_baseline(model: tf.keras.Model) -> None:
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+        metrics=[tf.keras.metrics.SparseCategoricalAccuracy(name="accuracy")],
+    )
+
+
+def baseline_callbacks(validation_ds: tf.data.Dataset, labels: np.ndarray, checkpoint: Path, patience: int):
+    f1_callback = ValidationMacroF1(validation_ds, labels, num_classes=7)
+    checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
+        filepath=str(checkpoint), monitor="val_macro_f1", mode="max", save_best_only=True,
+    )
+    stop_callback = tf.keras.callbacks.EarlyStopping(
+        monitor="val_macro_f1", mode="max", patience=patience, restore_best_weights=False,
+    )
+    # Order matters: F1 must be in logs before the next two callbacks read it.
+    return [f1_callback, checkpoint_callback, stop_callback], f1_callback
+
+
+def train_one(
+    architecture: str, *, config: dict, splits_dir: Path, outputs_dir: Path, batch_size: int,
+) -> tuple[str, dict]:
+    """Train one ImageNet frozen baseline and score only its best checkpoint."""
+    train, validation, mapping = load_training_partitions(splits_dir)
+    tf.keras.backend.clear_session()
+    set_seed(config["seed"])
+    model, backbone = build_frozen_classifier(
+        architecture, num_classes=len(mapping), image_size=tuple(config["image_size"]),
+        weights="imagenet", seed=config["seed"],
+    )
+    if backbone.trainable or backbone.trainable_weights:
+        raise AssertionError("Backbone is not fully frozen.")
+    compile_baseline(model)
+    counts = parameter_counts(model)
+    train_ds = make_image_dataset(train, training=True, batch_size=batch_size, architecture=architecture, seed=config["seed"])
+    validation_ds = make_image_dataset(validation, training=False, batch_size=batch_size, architecture=architecture)
+    assert_validation_order(validation_ds, validation["class_index"].to_numpy())
+
+    run_id, run_dir = create_run_directory(outputs_dir, architecture)
+    checkpoint = run_dir / "best.keras"
+    run_config = {
+        **config, "run_id": run_id, "architecture": architecture,
+        "batch_size": batch_size, "parent_run_id": None,
+        "comparator": config["comparison_group"],
+        "splits_dir": str(Path(splits_dir).resolve()),
+        "class_mapping": mapping,
+        "preprocessing": "raw RGB 0-255 for EfficientNetB0; Keras preprocess_input once for MobileNetV2/ResNet50",
+        "checkpoint_selection": "highest full-validation macro F1; first epoch wins ties",
+    }
+    save_json(run_config, run_dir / "config.json")
+    callbacks, f1_callback = baseline_callbacks(
+        validation_ds, validation["class_index"].to_numpy(dtype=int),
+        checkpoint, config["early_stopping_patience"],
+    )
+    started = time.perf_counter()
+    history = model.fit(
+        train_ds, validation_data=validation_ds, epochs=config["max_epochs"],
+        callbacks=callbacks, verbose=2,
+    )
+    duration = time.perf_counter() - started
+    if not checkpoint.is_file():
+        raise AssertionError("No best checkpoint was saved.")
+    history_frame = pd.DataFrame(history.history)
+    history_frame.insert(0, "epoch", np.arange(1, len(f1_callback.scores) + 1))
+    history_frame["val_macro_f1"] = f1_callback.scores
+    history_frame["learning_rate"] = f1_callback.learning_rates
+    history_frame.to_csv(run_dir / "history.csv", index=False)
+    plot_learning_curves(history_frame, run_dir / "learning_curves.png")
+    best_epoch = int(np.argmax(f1_callback.scores) + 1)
+
+    best_model = tf.keras.models.load_model(checkpoint)
+    best_probabilities = best_model.predict(validation_ds, verbose=0)
+    predictions, scores = evaluate_validation(validation, best_probabilities, mapping)
+    if not np.isclose(scores["validation_macro_f1"], f1_callback.scores[best_epoch - 1], atol=1e-7):
+        raise AssertionError("Best checkpoint score differs from the recorded best epoch.")
+    predictions.to_csv(run_dir / "validation_predictions.csv", index=False)
+
+    runtime = runtime_info(batch_size)
+    metrics = {
+        "run_id": run_id, "architecture": architecture, **scores,
+        "actual_epochs": len(f1_callback.scores), "best_epoch": best_epoch,
+        "training_seconds": duration, **counts,
+        "framework_versions": {key: runtime[key] for key in ("python", "tensorflow", "keras", "pandas", "numpy", "scikit_learn")},
+        "detected_training_device": "GPU" if runtime["gpus"] else "CPU",
+        "visible_gpus": runtime["gpus"],
+        "best_checkpoint": str(checkpoint),
+        "validation_images": len(validation),
+    }
+    save_json(metrics, run_dir / "metrics.json")
+    append_experiment_log(outputs_dir, {
+        "run_id": run_id, "comparison_group": config["comparison_group"],
+        "parent_run_id": "", "architecture": architecture,
+        "augmentation": False, "class_weights": False,
+        "dropout": 0, "l2": 0, "optimizer": "adam", "learning_rate": 1e-3,
+        "batch_size": batch_size, "seed": config["seed"],
+        "actual_epochs": metrics["actual_epochs"], "best_epoch": best_epoch,
+        "validation_accuracy": scores["validation_accuracy"],
+        "validation_macro_f1": scores["validation_macro_f1"],
+        "validation_balanced_accuracy": scores["validation_balanced_accuracy"],
+        "training_seconds": duration, **counts,
+        "detected_training_device": metrics["detected_training_device"],
+        "run_dir": str(run_dir),
+    })
+    print(f"Saved run {run_id}: best epoch {best_epoch}, validation macro F1 {scores['validation_macro_f1']:.4f}")
+    return run_id, metrics
+
+
+def smoke_one(architecture: str, *, config: dict, splits_dir: Path) -> dict:
+    """One batch and one epoch with random backbone weights; no experiment output."""
+    train, validation, mapping = load_training_partitions(splits_dir)
+    tf.keras.backend.clear_session()
+    set_seed(config["seed"])
+    train_small = train.groupby("class_index", sort=True, group_keys=False).head(1)
+    validation_small = validation.groupby("class_index", sort=True, group_keys=False).head(1)
+    model, backbone = build_frozen_classifier(
+        architecture, num_classes=len(mapping), image_size=(224, 224),
+        weights=None, seed=config["seed"],
+    )
+    if backbone.trainable or backbone.trainable_weights:
+        raise AssertionError("Backbone is not fully frozen.")
+    compile_baseline(model)
+    train_ds = make_image_dataset(train_small, training=True, batch_size=7, architecture=architecture)
+    validation_ds = make_image_dataset(validation_small, training=False, batch_size=7, architecture=architecture)
+    assert_validation_order(validation_ds, validation_small["class_index"].to_numpy())
+    with tempfile.TemporaryDirectory(prefix="ham_day2_smoke_") as temporary:
+        checkpoint = Path(temporary) / "best.keras"
+        callbacks, f1_callback = baseline_callbacks(
+            validation_ds, validation_small["class_index"].to_numpy(dtype=int), checkpoint, patience=3,
+        )
+        history = model.fit(train_ds, validation_data=validation_ds, epochs=1, callbacks=callbacks, verbose=0)
+        loss = float(history.history["loss"][0])
+        if not np.isfinite(loss) or not checkpoint.is_file():
+            raise AssertionError("Smoke loss is nonfinite or the best checkpoint is missing.")
+        restored = tf.keras.models.load_model(checkpoint)
+        current = model.predict(validation_ds, verbose=0)
+        reloaded = restored.predict(validation_ds, verbose=0)
+        difference = float(np.max(np.abs(current - reloaded)))
+        if not np.isfinite(difference) or difference > 1e-5:
+            raise AssertionError(f"Checkpoint reload difference too large: {difference}")
+    result = {
+        "architecture": architecture, "smoke_only": True,
+        "pretrained_weights": None, "training_images": len(train_small),
+        "validation_images": len(validation_small), "one_epoch_loss": loss,
+        "val_macro_f1_pipeline_check": f1_callback.scores[0],
+        "checkpoint_reload_max_probability_difference": difference,
+        **parameter_counts(model), "backbone_frozen": True,
+    }
+    print(json.dumps(result, indent=2))
+    return result
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    architecture_group = parser.add_mutually_exclusive_group(required=True)
+    architecture_group.add_argument("--architecture", choices=ARCHITECTURES)
+    architecture_group.add_argument("--all", action="store_true", help="Run all three architectures sequentially")
+    action_group = parser.add_mutually_exclusive_group(required=True)
+    action_group.add_argument("--smoke", action="store_true", help="Tiny random-weight pipeline and checkpoint check")
+    action_group.add_argument("--run", action="store_true", help="Start full ImageNet baseline training")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--splits-dir", type=Path, default=Path("day1_artifacts"))
+    parser.add_argument("--outputs-dir", type=Path, default=Path("outputs"))
+    parser.add_argument("--batch-size", type=int, choices=(16, 32), help="Override the shared configured batch size")
+    args = parser.parse_args()
+    config = load_config(args.config)
+    batch_size = args.batch_size or config["batch_size"]
+    architectures = config["architectures"] if args.all else [args.architecture]
+    for architecture in architectures:
+        if args.smoke:
+            smoke_one(architecture, config=config, splits_dir=args.splits_dir)
+        else:
+            train_one(
+                architecture, config=config, splits_dir=args.splits_dir,
+                outputs_dir=args.outputs_dir, batch_size=batch_size,
+            )
+
+
+if __name__ == "__main__":
+    main()
