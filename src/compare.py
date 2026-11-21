@@ -17,6 +17,7 @@ from .utils import save_json
 METRICS = ("validation_accuracy", "validation_macro_f1", "validation_balanced_accuracy")
 GROUPS = {False: "day2_frozen_no_augmentation", True: "day3_frozen_moderate_augmentation"}
 HEAD_EXPERIMENT_STAGES = ("T2_E0_CW", "T3_E0_D", "T3_E0_L")
+OPTIMIZER_NAMES = ("adam", "rmsprop", "sgd_momentum")
 
 
 def build_comparison(log: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -91,6 +92,60 @@ def write_head_experiment_comparisons(outputs_dir: Path, mapping: dict[str, int]
     if rows:
         pd.DataFrame(rows).to_csv(outputs_dir / "day4_comparison.csv", index=False)
         save_json(decisions, outputs_dir / "day4_decisions.json")
+
+
+def write_optimizer_comparison(outputs_dir: Path, reference_run_id: str) -> None:
+    """Compare saved five-epoch checkpoints only after all three runs finish."""
+    outputs_dir = Path(outputs_dir).resolve()
+    log = pd.read_csv(outputs_dir / "experiment_log.csv")
+    group = log.loc[log.comparison_group == "frozen_optimizer_comparison"]
+    if len(group) < len(OPTIMIZER_NAMES):
+        return
+    rows = []
+    controls = []
+    for name in OPTIMIZER_NAMES:
+        matches = group.loc[group.optimizer == name]
+        if len(matches) != 1 or str(matches.iloc[0].get("run_status", "valid")) == "invalid":
+            raise ValueError(f"Expected one valid {name} optimizer run.")
+        run_id = str(matches.iloc[0].run_id)
+        run_dir = outputs_dir / "runs" / run_id
+        config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+        metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+        if metrics["actual_epochs"] != 5 or config["reference_run_id"] != reference_run_id:
+            raise ValueError(f"Incomplete or mismatched optimizer run {run_id}.")
+        controls.append((config["architecture"], config["seed"], tuple(config["image_size"]),
+                         config["batch_size"], config["pretrained_weights"],
+                         config["backbone_trainable"], config["augmentation"],
+                         config["head_units"], config["class_weights"], config["dropout"],
+                         config["l2"], config["loss"], config["selection_metric"],
+                         config["initial_head_sha256"],
+                         tuple(sorted(config["split_file_sha256"].items())), metrics["optimizer_updates"]))
+        rows.append({
+            "optimizer": name, "learning_rate": config["learning_rate"], "run_id": run_id,
+            "best_epoch": metrics["best_epoch"],
+            "validation_macro_f1": metrics["validation_macro_f1"],
+            "validation_accuracy": metrics["validation_accuracy"],
+            "validation_balanced_accuracy": metrics["validation_balanced_accuracy"],
+            "training_seconds": metrics["training_seconds"],
+        })
+    if len(set(controls)) != 1:
+        raise ValueError("Optimizer runs do not share seed, split, head initialization, or update count.")
+    adam_score = rows[0]["validation_macro_f1"]
+    for row in rows:
+        row["delta_macro_f1_vs_fresh_adam"] = row["validation_macro_f1"] - adam_score
+    pd.DataFrame(rows).to_csv(outputs_dir / "optimizer_comparison.csv", index=False)
+    winner = max(rows, key=lambda row: row["validation_macro_f1"])
+    reference = json.loads((outputs_dir / "runs" / reference_run_id / "metrics.json").read_text(encoding="utf-8"))
+    save_json({
+        "criterion": "highest best-checkpoint validation macro F1 among fresh five-epoch runs",
+        "provisional_candidate_run_id": winner["run_id"],
+        "provisional_candidate_optimizer": winner["optimizer"],
+        "provisional_candidate_macro_f1": winner["validation_macro_f1"],
+        "longer_budget_reference_run_id": reference_run_id,
+        "longer_budget_reference_macro_f1": reference["validation_macro_f1"],
+        "matched_longer_budget_confirmation_warranted": True,
+        "note": "Five-epoch optimizer-plus-learning-rate results do not establish a universal optimizer ranking. Keep the longer-budget reference checkpoint unless a matched confirmation supports replacement.",
+    }, outputs_dir / "optimizer_decision.json")
 
 
 def main() -> None:

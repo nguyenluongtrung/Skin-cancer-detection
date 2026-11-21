@@ -568,6 +568,34 @@ L2 (`T3_E0_L`) completed with best-checkpoint validation macro F1 **0.621915** a
 | Dropout 0.3 | 0.572482 | -0.047604 | Reject |
 | L2 0.0001 | 0.621915 | +0.001829 | Keep |
 
+### Controlled optimizer comparison
+
+The selected longer-budget reference is the Day 4 L2 checkpoint (validation macro F1 **0.621915** after up to 12 epochs). The following commands create fresh ImageNet models; they never resume that checkpoint. Run them from the repository root, one at a time or sequentially:
+
+```powershell
+.venv\Scripts\python.exe -m src.train --optimizer-choice adam --config configs/frozen_optimizer_comparison.json --run
+.venv\Scripts\python.exe -m src.train --optimizer-choice rmsprop --config configs/frozen_optimizer_comparison.json --run
+.venv\Scripts\python.exe -m src.train --optimizer-choice sgd_momentum --config configs/frozen_optimizer_comparison.json --run
+```
+
+Each run uses the same saved train/validation splits, integer class mapping, seed 42, training shuffle seed, 224 × 224 RGB input, batch size 32, frozen EfficientNetB0 in inference mode, GAP, Dense(128, ReLU) with kernel L2 `0.0001`, and seven-class softmax. There is no augmentation, class weighting, or dropout. Each optimizer is newly constructed with empty state. The runs complete exactly five epochs with 224 updates per epoch and a constant specified learning rate; only full-validation macro F1 scoring and best-checkpoint saving run as callbacks. The recorded head-weight hash and split-file hashes must match across all three runs before comparison output is written. Logged total loss includes the L2 term.
+
+Adam uses learning rate `0.001`, first-moment coefficient `0.9`, second-moment coefficient `0.999`, and no AMSGrad. RMSprop uses learning rate `0.001`, squared-gradient averaging coefficient `0.9`, zero momentum, and no centering. SGD with momentum uses learning rate `0.01`, momentum `0.9`, and no Nesterov acceleration. Installed Keras defaults supply epsilon for Adam and RMSprop; its resolved value is saved in each run's configuration. Optimizer EMA and optimizer weight decay stay disabled.
+
+SGD momentum maintains an exponentially weighted average of gradients. RMSprop maintains an exponentially weighted average of squared gradients. Adam maintains first and second moments with bias correction. This comparison varies complete optimizer-plus-learning-rate configurations; it does not separately ablate these mechanisms or establish a universal ranking.
+
+Each command creates a unique `outputs/runs/<run_id>/` containing `config.json`, `best.keras`, `history.csv`, `validation_predictions.csv`, `metrics.json`, and `learning_curves.png`, and appends `outputs/experiment_log.csv`. After the third run, `outputs/optimizer_comparison.csv` compares the three fresh best checkpoints, and `outputs/optimizer_decision.json` records a provisional winner and the separate Day 4 reference. The five-epoch winner needs a matched longer-budget confirmation before choosing the next starting point, especially if it scores below the Day 4 checkpoint. No longer run or test evaluation starts automatically.
+
+All three five-epoch runs completed. They used the same split-file hashes and initial head-weight hash, and each completed 1,120 optimizer updates. The table reports each run's best checkpoint, which can precede epoch 5.
+
+| Optimizer | Learning rate | Best epoch | Validation macro F1 | Accuracy | Balanced accuracy | Training seconds | Macro F1 vs fresh Adam |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Adam | 0.001 | 5 | **0.586173** | 0.778477 | 0.574334 | 675.1 | 0 |
+| RMSprop | 0.001 | 2 | 0.540248 | 0.751223 | 0.545301 | 647.7 | -0.045925 |
+| SGD with momentum | 0.01 | 5 | 0.541468 | 0.757512 | 0.557551 | 545.7 | -0.044705 |
+
+Adam is the provisional winner for this optimizer-plus-learning-rate comparison. The Day 4 L2 checkpoint scored **0.621915** with a longer, up-to-12-epoch budget; it is a separate reference and remains the selected checkpoint. A matched longer-budget comparison is warranted before using the short-run ranking to choose a different optimizer for the next stage. These results do not show that one optimizer is universally better. Test data and metrics remain closed.
+
 | Model                | Test accuracy | Test macro F1 | Test balanced accuracy |
 | -------------------- | ------------: | ------------: | ---------------------: |
 | Baseline             |       Pending |       Pending |                Pending |

@@ -1,0 +1,23 @@
+{
+  "comparison_group": "frozen_optimizer_comparison",
+  "architecture": "efficientnetb0",
+  "seed": 42,
+  "image_size": [224, 224],
+  "batch_size": 32,
+  "max_epochs": 5,
+  "pretrained_weights": "imagenet",
+  "backbone_trainable": false,
+  "augmentation": false,
+  "head_units": 128,
+  "class_weights": false,
+  "dropout": 0.0,
+  "l2": 0.0001,
+  "loss": "sparse_categorical_crossentropy",
+  "selection_metric": "val_macro_f1",
+  "reference_run_id": "20261121T134510640652Z_t3_e0_l_e8ee6a73",
+  "optimizers": {
+    "adam": {"learning_rate": 0.001, "beta_1": 0.9, "beta_2": 0.999, "amsgrad": false},
+    "rmsprop": {"learning_rate": 0.001, "rho": 0.9, "momentum": 0.0, "centered": false},
+    "sgd_momentum": {"learning_rate": 0.01, "momentum": 0.9, "nesterov": false}
+  }
+}
