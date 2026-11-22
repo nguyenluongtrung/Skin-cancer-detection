@@ -35,6 +35,7 @@ DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "day2_frozen_
 HEAD_EXPERIMENT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "frozen_head_experiments.json"
 OPTIMIZER_COMPARISON_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "frozen_optimizer_comparison.json"
 FINE_TUNE_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "efficientnetb0_partial_fine_tune.json"
+BROADER_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "efficientnetb0_broader_fine_tune.json"
 DEPTH_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "efficientnetb0_shallow_fine_tune.json"
 OVERSAMPLING_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "efficientnetb0_moderate_oversampling.json"
 MILD_AUGMENTATION_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "efficientnetb0_mild_augmentation.json"
@@ -556,7 +557,7 @@ def load_fine_tune_config(path: Path, outputs_dir: Path) -> dict:
     reference_id = json.loads((outputs_dir / "day4_decisions.json").read_text(encoding="utf-8"))[-1]["selected_run_id"]
     if config.get("parent_run_id") != reference_id:
         raise ValueError("Fine-tuning parent must be the selected Day 4 checkpoint.")
-    row, parent, _ = logged_run(outputs_dir, reference_id)
+    row, parent, parent_metrics = logged_run(outputs_dir, reference_id)
     if row.get("run_status") == "invalid" or parent.get("stage") != "T3_E0_L":
         raise ValueError("Selected Day 4 parent is invalid or is not the L2 experiment.")
     for key in ("architecture", "seed", "image_size", "batch_size", "pretrained_weights",
@@ -564,10 +565,11 @@ def load_fine_tune_config(path: Path, outputs_dir: Path) -> dict:
         if config.get(key) != parent.get(key):
             raise ValueError(f"Fine-tuning config differs from selected parent on {key}.")
     first_block = config.get("first_trainable_block", 6)
-    if first_block not in (6, 7):
-        raise ValueError("Fine-tuning boundary must start at block6 or block7.")
-    group = ("efficientnetb0_partial_fine_tune" if first_block == 6
-             else "efficientnetb0_shallow_fine_tune")
+    if first_block not in (0, 6, 7):
+        raise ValueError("Fine-tuning boundary must use all non-BN layers or start at block6 or block7.")
+    group = ("efficientnetb0_broader_fine_tune" if first_block == 0 else
+             "efficientnetb0_partial_fine_tune" if first_block == 6 else
+             "efficientnetb0_shallow_fine_tune")
     required = {"comparison_group": group, "optimizer": "adam",
                 "learning_rate": 1e-5, "beta_1": 0.9, "beta_2": 0.999,
                 "amsgrad": False, "max_epochs": 15, "reduce_lr_factor": 0.5,
@@ -576,10 +578,10 @@ def load_fine_tune_config(path: Path, outputs_dir: Path) -> dict:
     for key, value in required.items():
         if config.get(key) != value:
             raise ValueError(f"Fine-tuning requires {key}={value!r}.")
-    if first_block == 7:
+    if first_block in (0, 7):
         day6_id = config.get("day6_comparator_run_id")
         if not day6_id:
-            raise ValueError("Day 7 requires an explicit Day 6 comparator run ID.")
+            raise ValueError("A boundary comparison requires an explicit Day 6 comparator run ID.")
         day6_row, day6_config, day6_metrics = logged_run(outputs_dir, day6_id)
         if (day6_row.get("run_status") == "invalid"
                 or day6_config.get("comparison_group") != "efficientnetb0_partial_fine_tune"
@@ -594,6 +596,15 @@ def load_fine_tune_config(path: Path, outputs_dir: Path) -> dict:
                     "l2", "head_units", "loss", "selection_metric"):
             if config.get(key) != day6_config.get(key):
                 raise ValueError(f"Day 7 differs from Day 6 on {key}.")
+    if first_block == 0:
+        day10 = json.loads((outputs_dir / "day10_audit.json").read_text(encoding="utf-8"))
+        if (day10.get("verdict") != "READY" or
+                day10["runs"]["day4"]["checkpoint_sha256"] != config.get("parent_checkpoint_sha256") or
+                day10["runs"]["day6"]["checkpoint_sha256"] != config.get("day6_checkpoint_sha256") or
+                day10["runs"]["day6"]["run_id"] != day6_id or
+                day10["runs"]["day4"]["validation_metrics_recomputed"]["validation_macro_f1"] != parent_metrics["validation_macro_f1"] or
+                day10["runs"]["day6"]["validation_metrics_recomputed"]["validation_macro_f1"] != day6_metrics["validation_macro_f1"]):
+            raise ValueError("Day 10 audit does not verify the Day 11 controls.")
     return config
 
 
@@ -725,14 +736,20 @@ def audit_fine_tune_parent(config: dict, splits_dir: Path, outputs_dir: Path):
         raise AssertionError("Checkpoint architecture or hidden-layer L2 differs from Day 4.")
     if len(model.get_layer("global_average_pooling").weights) != 0 or not np.isfinite(hidden.kernel.numpy()).all():
         raise AssertionError("Checkpoint head has invalid weights.")
-    probabilities = model.predict(validation_ds, verbose=0)
-    predictions, metrics = evaluate_validation(validation, probabilities, mapping)
-    saved = pd.read_csv(parent_dir / "validation_predictions.csv")
-    if (not np.array_equal(predictions["image_id"].to_numpy(), saved["image_id"].to_numpy())
-            or not np.array_equal(predictions["true_class_index"].to_numpy(), saved["true_class_index"].to_numpy())
-            or not np.array_equal(predictions["predicted_class_index"].to_numpy(),
-                                  saved["predicted_class_index"].to_numpy())):
-        raise AssertionError("Saved validation prediction order or labels differ from checkpoint inference.")
+    if config.get("first_trainable_block") == 0:
+        day10 = json.loads((outputs_dir / "day10_audit.json").read_text(encoding="utf-8"))
+        metrics = day10["runs"]["day4"]["validation_metrics_recomputed"]
+        if day10.get("class_mapping") != mapping:
+            raise AssertionError("Day 10 class mapping differs from the saved split.")
+    else:
+        probabilities = model.predict(validation_ds, verbose=0)
+        predictions, metrics = evaluate_validation(validation, probabilities, mapping)
+        saved = pd.read_csv(parent_dir / "validation_predictions.csv")
+        if (not np.array_equal(predictions["image_id"].to_numpy(), saved["image_id"].to_numpy())
+                or not np.array_equal(predictions["true_class_index"].to_numpy(), saved["true_class_index"].to_numpy())
+                or not np.array_equal(predictions["predicted_class_index"].to_numpy(),
+                                      saved["predicted_class_index"].to_numpy())):
+            raise AssertionError("Saved validation prediction order or labels differ from checkpoint inference.")
     tolerance = 1e-6
     metric_differences = {key: abs(metrics[key] - parent_metrics[key]) for key in
                           ("validation_accuracy", "validation_macro_f1", "validation_balanced_accuracy")}
@@ -741,6 +758,12 @@ def audit_fine_tune_parent(config: dict, splits_dir: Path, outputs_dir: Path):
     checkpoint_hash = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     if config.get("parent_checkpoint_sha256") and checkpoint_hash != config["parent_checkpoint_sha256"]:
         raise AssertionError("Parent checkpoint SHA256 differs from the configured identity.")
+    if config.get("first_trainable_block") == 0:
+        if checkpoint_hash != day10["runs"]["day4"]["checkpoint_sha256"]:
+            raise AssertionError("Day 10 parent hash differs from current checkpoint.")
+        for name, expected_hash in day10["split_file_sha256"].items():
+            if hashlib.sha256((splits_dir / name).read_bytes()).hexdigest() != expected_hash:
+                raise AssertionError(f"Day 10 split hash differs for {name}.")
     return model, train, validation, mapping, validation_ds, metrics, {
         "parent_run_id": parent_id, "parent_checkpoint": str(checkpoint.resolve()),
         "parent_checkpoint_sha256": checkpoint_hash,
@@ -756,7 +779,7 @@ def audit_fine_tune_parent(config: dict, splits_dir: Path, outputs_dir: Path):
 
 def audit_day6_boundary(model: tf.keras.Model, config: dict, outputs_dir: Path, audit: dict) -> dict:
     """Confirm the saved Day 6 boundary and provenance before Day 7."""
-    if (config.get("first_trainable_block", 6) != 7
+    if (config.get("first_trainable_block", 6) not in (0, 7)
             and config.get("sampling_policy") is None
             and config.get("augmentation_policy") != "mild_day9"):
         return {}
@@ -1023,6 +1046,117 @@ def smoke_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> dict:
     return result
 
 
+def smoke_broader_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> dict:
+    """Check the Day 11 boundary and time disposable CPU updates at batch size 32."""
+    tf.keras.backend.clear_session()
+    set_seed(config["seed"])
+    model, train, _, _, validation_ds, _, audit = audit_fine_tune_parent(
+        config, splits_dir, outputs_dir)
+    comparator = audit_day6_boundary(model, config, outputs_dir, audit)
+    checkpoint = outputs_dir / "runs" / config["day6_comparator_run_id"] / "best.keras"
+    comparator_hash = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    if comparator_hash != config["day6_checkpoint_sha256"]:
+        raise AssertionError("Day 6 comparator checkpoint hash changed.")
+    images, _ = next(iter(validation_ds.take(1)))
+    parent_weights = [weight.numpy().copy() for weight in model.weights]
+    initial = model(images, training=False).numpy()
+    boundary = unfreeze_efficientnet_upper_stages(model, first_block=0)
+    difference = float(np.max(np.abs(initial - model(images, training=False).numpy())))
+    if difference > 1e-7 or any(not np.array_equal(a, w.numpy()) for a, w in zip(parent_weights, model.weights)):
+        raise AssertionError("Changing trainability altered the parent weights or inference.")
+    backbone = model.get_layer("efficientnetb0")
+    bn_layers = [layer for layer in backbone.layers if isinstance(layer, tf.keras.layers.BatchNormalization)]
+    if not bn_layers or any(layer.trainable for layer in bn_layers):
+        raise AssertionError("Backbone BatchNormalization is not fully frozen.")
+    bn_weights = [weight for layer in bn_layers for weight in layer.weights]
+    bn_before = [weight.numpy().copy() for weight in bn_weights]
+    kernels = {name: layer.kernel for name, layer in (
+        ("stem_conv", backbone.get_layer("stem_conv")),
+        ("block3a_expand_conv", backbone.get_layer("block3a_expand_conv")),
+        ("block5a_expand_conv", backbone.get_layer("block5a_expand_conv")),
+        ("block6a_expand_conv", backbone.get_layer("block6a_expand_conv")),
+        ("block7a_expand_conv", backbone.get_layer("block7a_expand_conv")),
+        ("top_conv", backbone.get_layer("top_conv")),
+        ("dense_128", model.get_layer("dense_128")),
+        ("class_probabilities", model.get_layer("class_probabilities")),
+    )}
+    if any(not any(weight is variable for variable in model.trainable_weights)
+           for weight in kernels.values()):
+        raise AssertionError("A representative convolution or head kernel is not trainable.")
+    if not np.isclose(model.get_layer("dense_128").kernel_regularizer.l2, config["l2"]):
+        raise AssertionError("Hidden-layer L2 changed.")
+    compile_fine_tune(model, config)
+    batches = list(make_image_dataset(train.head(96), training=True, batch_size=32,
+                                      architecture="efficientnetb0", seed=config["seed"]).take(3))
+    batch_images, batch_labels = batches[0]
+    with tf.GradientTape() as tape:
+        predictions = model(batch_images, training=True)
+        cross_entropy = tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(batch_labels, predictions))
+        loss = cross_entropy + tf.add_n(model.losses)
+    gradients = tape.gradient(loss, model.trainable_weights)
+    if any(gradient is None or not bool(tf.reduce_all(tf.math.is_finite(gradient)))
+           for gradient in gradients):
+        raise AssertionError("A trainable variable has a missing or nonfinite gradient.")
+    gradients_by_id = {id(weight): gradient for weight, gradient in zip(model.trainable_weights, gradients)}
+    checked_gradients = {}
+    for name, weight in kernels.items():
+        gradient = gradients_by_id.get(id(weight))
+        if gradient is None or not bool(tf.reduce_all(tf.math.is_finite(gradient))):
+            raise AssertionError(f"Missing or nonfinite gradient for {name}.")
+        checked_gradients[name] = float(tf.reduce_max(tf.abs(gradient)))
+    if not bool(tf.reduce_all(tf.math.is_finite(predictions))) or not np.isfinite(float(loss)):
+        raise AssertionError("Nonfinite model output or loss.")
+    before = {name: weight.numpy().copy() for name, weight in kernels.items()}
+    started = time.perf_counter()
+    model.train_on_batch(batch_images, batch_labels)
+    warmup_seconds = time.perf_counter() - started
+    changes = {name: float(np.max(np.abs(weight.numpy() - before[name])))
+               for name, weight in kernels.items()}
+    if any(value <= 0 for value in changes.values()):
+        raise AssertionError(f"Representative kernel did not update: {changes}")
+    steady = []
+    for batch_images, batch_labels in batches[1:]:
+        started = time.perf_counter()
+        model.train_on_batch(batch_images, batch_labels)
+        steady.append(time.perf_counter() - started)
+    bn_change = max(float(np.max(np.abs(weight.numpy() - value)))
+                    for weight, value in zip(bn_weights, bn_before))
+    if bn_change != 0:
+        raise AssertionError("A frozen BatchNormalization parameter or statistic changed.")
+    steps = int(np.ceil(len(train) / config["batch_size"]))
+    mean_step = float(np.mean(steady))
+    runtime = runtime_info(config["batch_size"])
+    result = {**audit, **comparator, **boundary,
+              "day6_checkpoint_sha256": comparator_hash,
+              "parent_inference_max_difference": difference,
+              "parent_weights_unchanged_before_updates": True,
+              "cross_entropy": float(cross_entropy), "loss_with_l2": float(loss),
+              "finite_trainable_gradient_count": len(gradients),
+              "representative_gradient_max_abs": checked_gradients,
+              "representative_kernel_update_max_abs": changes,
+              "batch_norm_layers_checked": len(bn_layers),
+              "batch_norm_variables_checked": len(bn_weights),
+              "max_batch_norm_variable_change": bn_change,
+              "warmup_step_seconds": warmup_seconds,
+              "steady_step_seconds": steady,
+              "approximate_training_step_seconds": mean_step,
+              "steps_per_epoch": steps,
+              "max_optimizer_updates": steps * config["max_epochs"],
+              "approximate_epoch_training_seconds_excluding_validation": mean_step * steps,
+              "approximate_max_training_seconds_excluding_validation": mean_step * steps * config["max_epochs"],
+              "historical_day6_fit_seconds_including_validation": 1439.7192012000014,
+              "validation_overhead_note": "Validation overhead was not measured separately; projections exclude it.",
+              "framework_versions": {key: runtime[key] for key in
+                                     ("python", "tensorflow", "keras", "pandas", "numpy", "scikit_learn")},
+              "detected_training_device": "GPU" if runtime["gpus"] else "CPU",
+              "visible_gpus": runtime["gpus"], "seed": config["seed"],
+              "smoke_only": True, "disposable_optimizer_updates": int(model.optimizer.iterations.numpy())}
+    save_json(result, outputs_dir / "day11_preflight.json")
+    print(json.dumps({key: result[key] for key in ("trainable_parameters", "warmup_step_seconds",
+          "steady_step_seconds", "steps_per_epoch", "approximate_max_training_seconds_excluding_validation")}, indent=2))
+    return result
+
+
 def train_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> tuple[str, dict]:
     """Fine-tune from a freshly reloaded Day 4 checkpoint and compare on validation."""
     tf.keras.backend.clear_session()
@@ -1030,9 +1164,25 @@ def train_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> tuple[
     model, train, validation, mapping, validation_ds, parent_metrics, audit = audit_fine_tune_parent(
         config, splits_dir, outputs_dir)
     comparator_audit = audit_day6_boundary(model, config, outputs_dir, audit)
+    day11 = config.get("first_trainable_block") == 0
+    if day11:
+        preflight = json.loads((outputs_dir / "day11_preflight.json").read_text(encoding="utf-8"))
+        day6_checkpoint = outputs_dir / "runs" / config["day6_comparator_run_id"] / "best.keras"
+        if (preflight.get("parent_checkpoint_sha256") != audit["parent_checkpoint_sha256"] or
+                preflight.get("split_file_sha256") != audit["split_file_sha256"] or
+                preflight.get("day6_checkpoint_sha256") != config["day6_checkpoint_sha256"] or
+                hashlib.sha256(day6_checkpoint.read_bytes()).hexdigest() != config["day6_checkpoint_sha256"]):
+            raise AssertionError("Day 11 preflight provenance differs from this run.")
+        tf.keras.backend.clear_session()
+        set_seed(config["seed"])
+        model, train, validation, mapping, validation_ds, parent_metrics, audit = audit_fine_tune_parent(
+            config, splits_dir, outputs_dir)
     sample, _ = next(iter(validation_ds.take(1)))
     original_probabilities = model(sample, training=False).numpy()
     boundary = unfreeze_efficientnet_upper_stages(model, first_block=config.get("first_trainable_block", 6))
+    if day11 and (boundary["trainable_parameters"] != preflight["trainable_parameters"] or
+                  boundary["backbone_trainable_variables"] != preflight["backbone_trainable_variables"]):
+        raise AssertionError("Day 11 boundary differs from disposable preflight.")
     if not np.allclose(original_probabilities, model(sample, training=False).numpy(), atol=1e-7, rtol=0):
         raise AssertionError("Changing trainability changed parent inference.")
     compile_fine_tune(model, config)
@@ -1065,7 +1215,8 @@ def train_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> tuple[
                                       augment=build_mild_augmentation(config["seed"]) if day9 else None,
                                       seed=config["seed"])
     day7 = config.get("first_trainable_block", 6) == 7
-    run_id, run_dir = create_run_directory(outputs_dir, "efficientnetb0_mild_augmentation" if day9
+    run_id, run_dir = create_run_directory(outputs_dir, "efficientnetb0_broader_fine_tune" if day11
+                                            else "efficientnetb0_mild_augmentation" if day9
                                             else "efficientnetb0_moderate_oversampling" if day8
                                             else "efficientnetb0_shallow_fine_tune" if day7
                                             else "efficientnetb0_fine_tune")
@@ -1077,7 +1228,8 @@ def train_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> tuple[
                "steps_per_epoch": int(np.ceil(len(train) / config["batch_size"])),
                "learning_rate_history_convention": "learning_rate_used is sampled at epoch start; learning_rate is sampled before end-of-epoch scheduling callbacks",
                "training_metric_distribution_note": ("Training accuracy and loss use augmented images for Day 9; compare with clean validation cautiously."
-                                                    if day9 else "Training accuracy and loss are measured on this branch's sampled images and are not directly comparable to the natural-frequency control."),
+                                                    if day9 else "Training uses ordinary natural-frequency sampling." if not day8
+                                                    else "Training accuracy and loss use sampled images and differ from the natural-frequency control."),
                "augmentation_semantics": {"order": ["horizontal_flip", "rotation", "zoom", "multiplicative_brightness"],
                                          "horizontal_flip_probability": 0.5, "rotation_degrees": [-10, 10],
                                          "zoom_image_scale": [0.95, 1.05], "brightness_multiplier": [0.95, 1.05],
@@ -1141,9 +1293,34 @@ def train_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> tuple[
                                   - parent_saved["per_class"][name][metric]
                                   for metric in ("precision", "recall", "f1")}} for name in names])
     per_class.to_csv(run_dir / "per_class_comparison.csv", index=False)
+    if day11:
+        day6_id = config["day6_comparator_run_id"]
+        _, day6_config, day6_metrics = logged_run(outputs_dir, day6_id)
+        pd.DataFrame([
+            {"experiment": label, "run_id": identity,
+             **{key: source[key] for key in ("validation_accuracy", "validation_macro_f1",
+                                          "validation_balanced_accuracy", "best_epoch", "actual_epochs", "training_seconds")},
+             "trainable_parameters": parameters,
+             "macro_f1_change_vs_day4": source["validation_macro_f1"] - parent_saved["validation_macro_f1"],
+             "macro_f1_change_vs_day6": source["validation_macro_f1"] - day6_metrics["validation_macro_f1"]}
+            for label, identity, source, parameters in (
+                ("Day 4 frozen parent", config["parent_run_id"], parent_saved, parent_saved["trainable_parameters"]),
+                ("Day 6 selected control", day6_id, day6_metrics, day6_config["trainable_parameters"]),
+                ("Day 11 broader backbone", run_id,
+                 {**scores, "best_epoch": best_epoch, "actual_epochs": len(frame), "training_seconds": duration},
+                 boundary["trainable_parameters"]))
+        ]).to_csv(run_dir / "three_way_validation_comparison.csv", index=False)
+        pd.DataFrame([
+            {"class": name, "support": scores["per_class"][name]["support"],
+             **{f"{stage}_{metric}": source["per_class"][name][metric]
+                for stage, source in (("day4", parent_saved), ("day6", day6_metrics), ("day11", scores))
+                for metric in ("precision", "recall", "f1")}}
+            for name in names]).to_csv(run_dir / "three_way_per_class_comparison.csv", index=False)
     reductions = [int(i + 1) for i in range(1, len(f1_callback.learning_rates))
                   if f1_callback.learning_rates[i] < f1_callback.learning_rates[i - 1]]
     retained = run_id if scores["validation_macro_f1"] > parent_metrics["validation_macro_f1"] else config["parent_run_id"]
+    if day11:
+        retained = run_id if scores["validation_macro_f1"] > day6_metrics["validation_macro_f1"] else day6_id
     if day8:
         control_id = config["day6_comparator_run_id"]
         _, control_config, control_metrics = logged_run(outputs_dir, control_id)
@@ -1242,6 +1419,11 @@ def train_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> tuple[
             "sampling distributions and are not directly comparable. This single run does not "
             "establish a reliable causal benefit."
         )
+    if day11:
+        interpretation = (f"Broader fine-tuning changed best-checkpoint validation macro F1 by "
+                          f"{scores['validation_macro_f1'] - day6_metrics['validation_macro_f1']:+.6f} "
+                          "versus Day 6 in one seed. Selection requires a strictly higher score; "
+                          "this single run does not establish reliability across seeds.")
     if day9:
         interpretation = (
             f"Mild augmentation changed validation macro F1 by "
@@ -1275,6 +1457,14 @@ def train_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> tuple[
                         "steps_per_epoch": updates_per_epoch, "optimizer_updates": actual_updates,
                         "training_image_exposures": len(frame) * len(train),
                         "training_metric_distribution_note": "Training images are augmented; clean validation metrics have a different input distribution."})
+    if day11:
+        metrics.update({"day6_control_run_id": day6_id,
+                        "day6_checkpoint_sha256": config["day6_checkpoint_sha256"],
+                        "best_checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+                        "macro_f1_change_vs_day6": scores["validation_macro_f1"] - day6_metrics["validation_macro_f1"],
+                        "macro_f1_change_vs_day4": scores["validation_macro_f1"] - parent_saved["validation_macro_f1"],
+                        "steps_per_epoch": updates_per_epoch, "optimizer_updates": actual_updates,
+                        "training_image_exposures": len(frame) * len(train)})
     if day7:
         metrics["macro_f1_change_vs_day6"] = scores["validation_macro_f1"] - day6_metrics["validation_macro_f1"]
         metrics["macro_f1_change_vs_frozen"] = scores["validation_macro_f1"] - parent_saved["validation_macro_f1"]
@@ -1293,7 +1483,7 @@ def train_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> tuple[
     append_experiment_log(outputs_dir, {
         "run_id": run_id, "comparison_group": config["comparison_group"],
         "parent_run_id": config["parent_run_id"],
-        "comparator_run_id": config["day6_comparator_run_id"] if day7 or day8 or day9 else config["parent_run_id"],
+        "comparator_run_id": config["day6_comparator_run_id"] if day7 or day8 or day9 or day11 else config["parent_run_id"],
         "architecture": "efficientnetb0", "augmentation": day9, "class_weights": False,
         "dropout": 0.0, "l2": config["l2"], "optimizer": "adam",
         "learning_rate": config["learning_rate"], "batch_size": config["batch_size"],
@@ -1321,6 +1511,8 @@ def main() -> None:
                                     help="Audit and partially fine-tune selected Day 4 EfficientNetB0")
     architecture_group.add_argument("--fine-tune-depth", action="store_true",
                                     help="Compare block7-only fine-tuning against the Day 6 candidate")
+    architecture_group.add_argument("--broader-fine-tune", action="store_true",
+                                    help="Compare all non-BN backbone layers against Day 6")
     architecture_group.add_argument("--moderate-oversampling", action="store_true",
                                     help="Compare sqrt-count training sampling against the Day 6 control")
     architecture_group.add_argument("--mild-augmentation", action="store_true",
@@ -1340,12 +1532,13 @@ def main() -> None:
         parser.error("Optimizer comparison requires --run and its fixed configured settings.")
     if args.parent_run_id and not args.stage:
         parser.error("--parent-run-id is only for head experiments.")
-    if args.fine_tune or args.fine_tune_depth or args.moderate_oversampling or args.mild_augmentation:
+    if args.fine_tune or args.fine_tune_depth or args.broader_fine_tune or args.moderate_oversampling or args.mild_augmentation:
         if args.batch_size or args.parent_run_id:
             parser.error("Fine-tuning uses the fixed batch size and selected Day 4 parent.")
         config_path = ((MILD_AUGMENTATION_CONFIG if args.mild_augmentation else
                         OVERSAMPLING_CONFIG if args.moderate_oversampling else
-                        DEPTH_CONFIG if args.fine_tune_depth else FINE_TUNE_CONFIG)
+                        DEPTH_CONFIG if args.fine_tune_depth else
+                        BROADER_CONFIG if args.broader_fine_tune else FINE_TUNE_CONFIG)
                        if args.config == DEFAULT_CONFIG else args.config)
         config = (load_mild_augmentation_config(config_path, args.outputs_dir) if args.mild_augmentation
                   else load_oversampling_config(config_path, args.outputs_dir) if args.moderate_oversampling
@@ -1354,8 +1547,12 @@ def main() -> None:
             parser.error("--fine-tune-depth requires the Day 7 block7 config.")
         if args.fine_tune and config.get("first_trainable_block", 6) != 6:
             parser.error("--fine-tune requires the Day 6 block6 config.")
+        if args.broader_fine_tune and config.get("first_trainable_block") != 0:
+            parser.error("--broader-fine-tune requires the Day 11 all non-BN config.")
         if args.smoke:
-            if args.mild_augmentation:
+            if args.broader_fine_tune:
+                smoke_broader_fine_tune(config, args.splits_dir, args.outputs_dir)
+            elif args.mild_augmentation:
                 smoke_mild_augmentation(config, args.splits_dir, args.outputs_dir)
             elif args.moderate_oversampling:
                 smoke_oversampling(config, args.splits_dir, args.outputs_dir)
