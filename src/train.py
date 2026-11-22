@@ -21,7 +21,7 @@ import pandas as pd
 import tensorflow as tf
 from sklearn.metrics import confusion_matrix, f1_score
 
-from .augmentation import build_moderate_augmentation
+from .augmentation import build_mild_augmentation, build_moderate_augmentation
 from .compare import (HEAD_EXPERIMENT_STAGES, OPTIMIZER_NAMES,
                       write_head_experiment_comparisons, write_optimizer_comparison)
 from .data_pipeline import (load_training_partitions, make_image_dataset,
@@ -37,6 +37,7 @@ OPTIMIZER_COMPARISON_CONFIG = Path(__file__).resolve().parents[1] / "configs" / 
 FINE_TUNE_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "efficientnetb0_partial_fine_tune.json"
 DEPTH_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "efficientnetb0_shallow_fine_tune.json"
 OVERSAMPLING_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "efficientnetb0_moderate_oversampling.json"
+MILD_AUGMENTATION_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "efficientnetb0_mild_augmentation.json"
 
 
 def load_config(path: Path) -> dict:
@@ -627,6 +628,36 @@ def load_oversampling_config(path: Path, outputs_dir: Path) -> dict:
     return config
 
 
+def load_mild_augmentation_config(path: Path, outputs_dir: Path) -> dict:
+    """Require Day 6 settings except for the explicitly named augmentation."""
+    config = json.loads(path.read_text(encoding="utf-8"))
+    if (config.get("comparison_group") != "efficientnetb0_mild_augmentation"
+            or config.get("augmentation_policy") != "mild_day9"
+            or config.get("augmentation") is not True
+            or config.get("first_trainable_block") != 6
+            or config.get("sampling_policy") != "natural"):
+        raise ValueError("Day 9 requires mild augmentation and ordinary block6 fine-tuning.")
+    row, day6, metrics = logged_run(outputs_dir, config["day6_comparator_run_id"])
+    if (row.get("run_status") == "invalid"
+            or day6.get("comparison_group") != "efficientnetb0_partial_fine_tune"
+            or metrics.get("retained_candidate_run_id") != config["day6_comparator_run_id"]
+            or metrics.get("validation_macro_f1") != 0.6266277351856852):
+        raise ValueError("Day 9 control is not the selected Day 6 run.")
+    for key in ("architecture", "parent_run_id", "seed", "image_size", "batch_size",
+                "max_epochs", "pretrained_weights", "class_weights", "dropout", "l2",
+                "head_units", "optimizer", "learning_rate", "beta_1", "beta_2", "amsgrad",
+                "loss", "selection_metric", "reduce_lr_factor", "reduce_lr_patience",
+                "min_lr", "early_stopping_patience", "min_delta"):
+        if config.get(key) != day6.get(key):
+            raise ValueError(f"Day 9 differs from Day 6 on {key}.")
+    if (day6.get("augmentation") is not False
+            or config.get("parent_checkpoint_sha256") != day6.get("parent_checkpoint_sha256")
+            or day6.get("backbone_call_training") is not False
+            or day6.get("preprocessing") != "original RGB 0-255; EfficientNet internal rescaling"):
+        raise ValueError("Day 6 augmentation, parent, or preprocessing does not match.")
+    return config
+
+
 def fine_tune_callbacks(validation_ds: tf.data.Dataset, labels: np.ndarray, checkpoint: Path, config: dict):
     """Calculate full-validation F1 before every callback that monitors it."""
     f1_callback = ValidationMacroF1(validation_ds, labels, num_classes=7)
@@ -725,7 +756,9 @@ def audit_fine_tune_parent(config: dict, splits_dir: Path, outputs_dir: Path):
 
 def audit_day6_boundary(model: tf.keras.Model, config: dict, outputs_dir: Path, audit: dict) -> dict:
     """Confirm the saved Day 6 boundary and provenance before Day 7."""
-    if config.get("first_trainable_block", 6) != 7 and config.get("sampling_policy") is None:
+    if (config.get("first_trainable_block", 6) != 7
+            and config.get("sampling_policy") is None
+            and config.get("augmentation_policy") != "mild_day9"):
         return {}
     day6_id = config["day6_comparator_run_id"]
     _, saved, metrics = logged_run(outputs_dir, day6_id)
@@ -856,6 +889,85 @@ def smoke_oversampling(config: dict, splits_dir: Path, outputs_dir: Path) -> dic
     return result
 
 
+def smoke_mild_augmentation(config: dict, splits_dir: Path, outputs_dir: Path) -> dict:
+    """Audit Day 6 control and training-only transformations without fitting."""
+    tf.keras.backend.clear_session()
+    set_seed(config["seed"])
+    model, train, validation, mapping, validation_ds, _, audit = audit_fine_tune_parent(
+        config, splits_dir, outputs_dir)
+    manifest = json.loads((splits_dir / "split_manifest.json").read_text(encoding="utf-8"))
+    if not manifest.get("zero_lesion_overlap") or not manifest.get("all_seven_classes_each_split"):
+        raise AssertionError("Saved splits do not pass lesion and class checks.")
+    control = audit_day6_boundary(model, config, outputs_dir, audit)
+    _, day6, metrics = logged_run(outputs_dir, config["day6_comparator_run_id"])
+    control_dir = outputs_dir / "runs" / config["day6_comparator_run_id"]
+    predictions = pd.read_csv(control_dir / "validation_predictions.csv")
+    history = pd.read_csv(control_dir / "history.csv")
+    control_f1 = f1_score(predictions.true_class_index, predictions.predicted_class_index,
+                          labels=list(range(7)), average="macro", zero_division=0)
+    if (day6.get("class_mapping") != mapping or len(history) != metrics["actual_epochs"]
+            or len(predictions) != len(validation)
+            or not np.array_equal(predictions.image_id, validation.image_id)
+            or not np.array_equal(predictions.true_class_index, validation.class_index)
+            or abs(control_f1 - metrics["validation_macro_f1"]) > 1e-12):
+        raise AssertionError("Day 6 saved validation/control artifacts disagree.")
+    batch_size = config["batch_size"]
+    ordinary = make_image_dataset(train, training=True, batch_size=batch_size,
+                                  architecture="efficientnetb0", seed=config["seed"])
+    augmented = make_image_dataset(train, training=True, batch_size=batch_size,
+                                   architecture="efficientnetb0",
+                                   augment=build_mild_augmentation(config["seed"]), seed=config["seed"])
+    clean_images, clean_labels = next(iter(ordinary.take(1)))
+    images, labels = next(iter(augmented.take(1)))
+    if (not np.array_equal(clean_labels, labels) or images.shape != clean_images.shape
+            or images.dtype != tf.float32 or not np.isfinite(images.numpy()).all()
+            or float(tf.reduce_min(images)) < 0 or float(tf.reduce_max(images)) > 255):
+        raise AssertionError("Augmented batch shape, labels, or pixels are invalid.")
+    names = [name for name, _ in sorted(mapping.items(), key=lambda item: item[1])]
+    examples = train.groupby("class_index", sort=True).head(1).sort_values("class_index")
+    originals, example_labels = next(iter(make_image_dataset(examples, batch_size=7).take(1)))
+    transformed = build_mild_augmentation(config["seed"])(originals, training=True)
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    montage_path = outputs_dir / "day9_mild_augmentation_examples.png"
+    plot_augmentation_pairs(originals.numpy(), transformed.numpy(), example_labels.numpy(), montage_path)
+    repeated = build_mild_augmentation(config["seed"])(originals, training=True)
+    if not np.array_equal(transformed.numpy(), repeated.numpy()):
+        raise AssertionError("Resetting the augmentation seed did not reproduce its first draw.")
+    policy = build_mild_augmentation(config["seed"])
+    first, second = policy(originals, training=True), policy(originals, training=True)
+    if np.array_equal(first.numpy(), second.numpy()):
+        raise AssertionError("Repeated training transforms did not vary.")
+    if not np.array_equal(policy(originals, training=False).numpy(), originals.numpy()):
+        raise AssertionError("Augmentation changed inference images.")
+    parent_weights = [weight.numpy().copy() for weight in model.weights]
+    boundary = unfreeze_efficientnet_upper_stages(model, first_block=6)
+    if (boundary["trainable_parameters"] != day6["trainable_parameters"]
+            or any(not np.array_equal(before, weight.numpy())
+                   for before, weight in zip(parent_weights, model.weights))):
+        raise AssertionError("Trainable count or parent weights differ from Day 6.")
+    compile_fine_tune(model, config)
+    if int(model.optimizer.iterations.numpy()) != 0:
+        raise AssertionError("Fine-tuning optimizer was not fresh.")
+    callbacks, _ = fine_tune_callbacks(validation_ds, validation.class_index.to_numpy(),
+                                       outputs_dir / "day9_smoke_unused.keras", config)
+    result = {**audit, **control, **boundary, "smoke_only": True,
+              "day6_control_reused": True, "day6_macro_f1": float(control_f1),
+              "training_images": len(train), "validation_images": len(validation),
+              "class_order": names, "training_class_counts": train.dx.value_counts().reindex(names).to_dict(),
+              "steps_per_epoch": int(np.ceil(len(train) / batch_size)),
+              "last_batch_size": len(train) % batch_size,
+              "maximum_optimizer_updates": config["max_epochs"] * int(np.ceil(len(train) / batch_size)),
+              "same_initial_weights": True, "seed_reproducible_first_transform": True,
+              "successive_transforms_vary": True, "validation_deterministic": True,
+              "callback_order": [type(callback).__name__ for callback in callbacks],
+              "augmentation_montage": str(montage_path.resolve()),
+              "augmentation_policy": config["augmentation_policy"]}
+    save_json(result, outputs_dir / "day9_preflight.json")
+    print(json.dumps({key: result[key] for key in ("day6_control_reused", "day6_macro_f1",
+          "training_images", "steps_per_epoch", "same_initial_weights", "augmentation_montage")}, indent=2))
+    return result
+
+
 def smoke_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> dict:
     """Verify gradients, frozen state, BN state, and reload on a disposable model."""
     tf.keras.backend.clear_session()
@@ -925,6 +1037,16 @@ def train_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> tuple[
         raise AssertionError("Changing trainability changed parent inference.")
     compile_fine_tune(model, config)
     day8 = config.get("sampling_policy") == "sqrt_training_class_count"
+    day9 = config.get("augmentation_policy") == "mild_day9"
+    if day9:
+        preflight_path = outputs_dir / "day9_preflight.json"
+        if not preflight_path.is_file():
+            raise ValueError("Run the Day 9 --smoke check before full training.")
+        preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+        if (preflight.get("parent_checkpoint_sha256") != audit["parent_checkpoint_sha256"]
+                or preflight.get("split_file_sha256") != audit["split_file_sha256"]
+                or preflight.get("day6_comparator_run_id") != config["day6_comparator_run_id"]):
+            raise AssertionError("Day 9 preflight provenance differs from this training run.")
     if day8:
         preflight_path = outputs_dir / "day8_preflight.json"
         if not preflight_path.is_file():
@@ -939,9 +1061,12 @@ def train_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> tuple[
                                       architecture="efficientnetb0", sampled_indices_by_epoch=schedules)
     else:
         train_ds = make_image_dataset(train, training=True, batch_size=config["batch_size"],
-                                      architecture="efficientnetb0", augment=None, seed=config["seed"])
+                                      architecture="efficientnetb0",
+                                      augment=build_mild_augmentation(config["seed"]) if day9 else None,
+                                      seed=config["seed"])
     day7 = config.get("first_trainable_block", 6) == 7
-    run_id, run_dir = create_run_directory(outputs_dir, "efficientnetb0_moderate_oversampling" if day8
+    run_id, run_dir = create_run_directory(outputs_dir, "efficientnetb0_mild_augmentation" if day9
+                                            else "efficientnetb0_moderate_oversampling" if day8
                                             else "efficientnetb0_shallow_fine_tune" if day7
                                             else "efficientnetb0_fine_tune")
     checkpoint = run_dir / "best.keras"
@@ -951,7 +1076,13 @@ def train_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> tuple[
                "backbone_call_training": False,
                "steps_per_epoch": int(np.ceil(len(train) / config["batch_size"])),
                "learning_rate_history_convention": "learning_rate_used is sampled at epoch start; learning_rate is sampled before end-of-epoch scheduling callbacks",
-               "training_metric_distribution_note": "Training accuracy and loss are measured on this branch's sampled images and are not directly comparable to the natural-frequency control.",
+               "training_metric_distribution_note": ("Training accuracy and loss use augmented images for Day 9; compare with clean validation cautiously."
+                                                    if day9 else "Training accuracy and loss are measured on this branch's sampled images and are not directly comparable to the natural-frequency control."),
+               "augmentation_semantics": {"order": ["horizontal_flip", "rotation", "zoom", "multiplicative_brightness"],
+                                         "horizontal_flip_probability": 0.5, "rotation_degrees": [-10, 10],
+                                         "zoom_image_scale": [0.95, 1.05], "brightness_multiplier": [0.95, 1.05],
+                                         "interpolation": "bilinear", "fill_mode": "reflect",
+                                         "brightness_clip": [0, 255]} if day9 else None,
                "loss_note": "Logged total loss includes hidden-layer L2 regularization."}, run_dir / "config.json")
     if day8:
         sampling_table.to_csv(run_dir / "sampling_probabilities.csv", index=False)
@@ -975,8 +1106,11 @@ def train_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> tuple[
     if day8:
         exposure_table.loc[exposure_table.epoch <= len(frame)].to_csv(
             run_dir / "sampled_class_exposures_by_epoch.csv", index=False)
-        frame["optimizer_updates_this_epoch"] = updates_per_epoch
         frame["sampled_image_exposures_this_epoch"] = len(train)
+    if day8 or day9:
+        frame["optimizer_updates_this_epoch"] = updates_per_epoch
+    if day9:
+        frame["training_image_exposures_this_epoch"] = len(train)
     frame.to_csv(run_dir / "history.csv", index=False)
     plot_learning_curves(frame, run_dir / "learning_curves.png")
     best_epoch = int(np.argmax(f1_callback.scores) + 1)
@@ -1033,6 +1167,26 @@ def train_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> tuple[
                           for branch, source in (("day6", control_metrics), ("day8", scores))
                           for metric in ("precision", "recall", "f1")}}
                       for name in names]).to_csv(run_dir / "sampling_per_class_comparison.csv", index=False)
+    if day9:
+        control_id = config["day6_comparator_run_id"]
+        _, control_config, control_metrics = logged_run(outputs_dir, control_id)
+        retained = run_id if scores["validation_macro_f1"] > control_metrics["validation_macro_f1"] else control_id
+        pd.DataFrame([
+            {"branch": branch, "run_id": identity,
+             **{key: source[key] for key in ("validation_accuracy", "validation_macro_f1",
+                "validation_balanced_accuracy", "actual_epochs", "best_epoch", "training_seconds")},
+             "trainable_parameters": parameters}
+            for branch, identity, source, parameters in (
+                ("day6_no_augmentation", control_id, control_metrics, control_config["trainable_parameters"]),
+                ("day9_mild_augmentation", run_id,
+                 {**scores, "actual_epochs": len(frame), "best_epoch": best_epoch,
+                  "training_seconds": duration}, boundary["trainable_parameters"]))
+        ]).to_csv(run_dir / "augmentation_validation_comparison.csv", index=False)
+        pd.DataFrame([{"class": name, "support": scores["per_class"][name]["support"],
+                       **{f"{branch}_{metric}": source["per_class"][name][metric]
+                          for branch, source in (("day6", control_metrics), ("day9", scores))
+                          for metric in ("precision", "recall", "f1")}}
+                      for name in names]).to_csv(run_dir / "augmentation_per_class_comparison.csv", index=False)
     if day7:
         day6_id = config["day6_comparator_run_id"]
         _, day6_config, day6_metrics = logged_run(outputs_dir, day6_id)
@@ -1088,6 +1242,14 @@ def train_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> tuple[
             "sampling distributions and are not directly comparable. This single run does not "
             "establish a reliable causal benefit."
         )
+    if day9:
+        interpretation = (
+            f"Mild augmentation changed validation macro F1 by "
+            f"{scores['validation_macro_f1'] - control_metrics['validation_macro_f1']:+.6f} "
+            "relative to the saved Day 6 control. Training metrics use augmented images, "
+            "so their gap from clean validation is not a like-for-like measure of overfitting. "
+            "One run does not establish a reliable improvement across seeds."
+        )
     runtime = runtime_info(config["batch_size"])
     metrics = {"run_id": run_id, "parent_run_id": config["parent_run_id"], **scores,
                "actual_epochs": len(frame), "best_epoch": best_epoch,
@@ -1106,6 +1268,13 @@ def train_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> tuple[
                         "steps_per_epoch": updates_per_epoch, "optimizer_updates": actual_updates,
                         "sampled_image_exposures": len(frame) * len(train),
                         "training_metric_distribution_note": "Training loss and accuracy use the oversampled distribution; do not compare directly to ordinary sampling."})
+    if day9:
+        metrics.update({"augmentation_policy": config["augmentation_policy"],
+                        "day6_control_run_id": control_id,
+                        "macro_f1_change_vs_day6": scores["validation_macro_f1"] - control_metrics["validation_macro_f1"],
+                        "steps_per_epoch": updates_per_epoch, "optimizer_updates": actual_updates,
+                        "training_image_exposures": len(frame) * len(train),
+                        "training_metric_distribution_note": "Training images are augmented; clean validation metrics have a different input distribution."})
     if day7:
         metrics["macro_f1_change_vs_day6"] = scores["validation_macro_f1"] - day6_metrics["validation_macro_f1"]
         metrics["macro_f1_change_vs_frozen"] = scores["validation_macro_f1"] - parent_saved["validation_macro_f1"]
@@ -1124,8 +1293,8 @@ def train_fine_tune(config: dict, splits_dir: Path, outputs_dir: Path) -> tuple[
     append_experiment_log(outputs_dir, {
         "run_id": run_id, "comparison_group": config["comparison_group"],
         "parent_run_id": config["parent_run_id"],
-        "comparator_run_id": config["day6_comparator_run_id"] if day7 or day8 else config["parent_run_id"],
-        "architecture": "efficientnetb0", "augmentation": False, "class_weights": False,
+        "comparator_run_id": config["day6_comparator_run_id"] if day7 or day8 or day9 else config["parent_run_id"],
+        "architecture": "efficientnetb0", "augmentation": day9, "class_weights": False,
         "dropout": 0.0, "l2": config["l2"], "optimizer": "adam",
         "learning_rate": config["learning_rate"], "batch_size": config["batch_size"],
         "seed": config["seed"], "actual_epochs": len(frame), "best_epoch": best_epoch,
@@ -1154,6 +1323,8 @@ def main() -> None:
                                     help="Compare block7-only fine-tuning against the Day 6 candidate")
     architecture_group.add_argument("--moderate-oversampling", action="store_true",
                                     help="Compare sqrt-count training sampling against the Day 6 control")
+    architecture_group.add_argument("--mild-augmentation", action="store_true",
+                                    help="Compare mild training augmentation against the Day 6 control")
     action_group = parser.add_mutually_exclusive_group(required=True)
     action_group.add_argument("--smoke", action="store_true", help="Tiny random-weight pipeline and checkpoint check")
     action_group.add_argument("--run", action="store_true", help="Start full ImageNet frozen training")
@@ -1169,20 +1340,24 @@ def main() -> None:
         parser.error("Optimizer comparison requires --run and its fixed configured settings.")
     if args.parent_run_id and not args.stage:
         parser.error("--parent-run-id is only for head experiments.")
-    if args.fine_tune or args.fine_tune_depth or args.moderate_oversampling:
+    if args.fine_tune or args.fine_tune_depth or args.moderate_oversampling or args.mild_augmentation:
         if args.batch_size or args.parent_run_id:
             parser.error("Fine-tuning uses the fixed batch size and selected Day 4 parent.")
-        config_path = ((OVERSAMPLING_CONFIG if args.moderate_oversampling else
+        config_path = ((MILD_AUGMENTATION_CONFIG if args.mild_augmentation else
+                        OVERSAMPLING_CONFIG if args.moderate_oversampling else
                         DEPTH_CONFIG if args.fine_tune_depth else FINE_TUNE_CONFIG)
                        if args.config == DEFAULT_CONFIG else args.config)
-        config = (load_oversampling_config(config_path, args.outputs_dir) if args.moderate_oversampling
+        config = (load_mild_augmentation_config(config_path, args.outputs_dir) if args.mild_augmentation
+                  else load_oversampling_config(config_path, args.outputs_dir) if args.moderate_oversampling
                   else load_fine_tune_config(config_path, args.outputs_dir))
         if args.fine_tune_depth and config.get("first_trainable_block") != 7:
             parser.error("--fine-tune-depth requires the Day 7 block7 config.")
         if args.fine_tune and config.get("first_trainable_block", 6) != 6:
             parser.error("--fine-tune requires the Day 6 block6 config.")
         if args.smoke:
-            if args.moderate_oversampling:
+            if args.mild_augmentation:
+                smoke_mild_augmentation(config, args.splits_dir, args.outputs_dir)
+            elif args.moderate_oversampling:
                 smoke_oversampling(config, args.splits_dir, args.outputs_dir)
             else:
                 smoke_fine_tune(config, args.splits_dir, args.outputs_dir)
