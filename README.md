@@ -635,6 +635,17 @@ Day 8 reuses the selected Day 6 run as the ordinary-sampling control. Both branc
 
 The smoke command writes `outputs/day8_preflight.json` and `outputs/day8_sampling_probabilities.csv`. It checks the control, parent hash and validation metrics, split hashes, sampling frequencies, epoch batch budget, identical initial weights and trainability, and callback order. The full command is manual. It creates a unique `outputs/runs/<run_id>/` with `sampling_probabilities.csv`, `sampled_class_exposures_by_epoch.csv`, `sampling_validation_comparison.csv`, `sampling_per_class_comparison.csv`, `history.csv`, `metrics.json`, `decision.json`, `validation_predictions.csv`, the best checkpoint, confusion matrices, and plots; it appends `outputs/experiment_log.csv`. Adopt the oversampled checkpoint only if its full-precision validation macro F1 exceeds Day 6's 0.6266277351856852. Test remains closed.
 
+## Day 9: mild augmentation during partial fine-tuning
+
+Day 9 keeps ordinary training sampling and the selected Day 6 fine-tuning recipe, reloading the same Day 4 learned checkpoint. Training images alone receive a seeded horizontal flip (probability 0.5), rotation up to 10 degrees, image zoom scale 0.95 to 1.05, and multiplicative brightness 0.95 to 1.05. Geometric transforms use bilinear interpolation and reflect fill; brightness is clipped to 0 to 255. Augmentation runs before EfficientNet preprocessing, with a new random draw for each training image. Validation is deterministic and unaugmented.
+
+```powershell
+.venv\Scripts\python.exe -m src.train --mild-augmentation --smoke --config configs/efficientnetb0_mild_augmentation.json
+.venv\Scripts\python.exe -m src.train --mild-augmentation --run --config configs/efficientnetb0_mild_augmentation.json
+```
+
+The smoke command saves `outputs/day9_preflight.json` and `outputs/day9_mild_augmentation_examples.png`, including one training image from every class. Inspect the montage before running the second command. The full command creates a unique run with the usual checkpoint, history, ordered validation predictions, metrics, confusion matrices and decision, plus `augmentation_validation_comparison.csv` and `augmentation_per_class_comparison.csv`. Select Day 9 only if its best-checkpoint validation macro F1 exceeds Day 6's 0.6266277351856852. Training metrics use augmented images; compare them with clean validation cautiously. Test remains closed.
+
 | Model                | Test accuracy | Test macro F1 | Test balanced accuracy |
 | -------------------- | ------------: | ------------: | ---------------------: |
 | Baseline             |       Pending |       Pending |                Pending |
