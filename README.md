@@ -392,6 +392,17 @@ Suggested callbacks:
 
 Keep the frozen model if fine-tuning does not improve validation performance.
 
+### Day 13: freeze validation ensemble selection, then evaluate test
+
+Run these two commands in order from the repository root. The first command validates the saved Day 6 and Day 11 best-checkpoint probabilities by image ID and saved class order, compares their fixed 0.5/0.5 ensemble with Day 11 on validation macro F1, and writes `outputs/day13/final_selection.json`. It does not run model inference or open test images. The second command requires that frozen selection artifact, verifies checkpoint and split hashes, then evaluates only the original Day 2 frozen EfficientNetB0 baseline and the selected final system on the saved test split. Neither command trains a model.
+
+```powershell
+.\.venv\Scripts\python.exe -m src.evaluate --phase validation --splits-dir .\day1_artifacts --outputs-dir .\outputs
+.\.venv\Scripts\python.exe -m src.evaluate --phase test --splits-dir .\day1_artifacts --outputs-dir .\outputs
+```
+
+The first command saves aligned validation component and ensemble predictions, metrics, confusion matrices, aggregate and per-class comparisons, checkpoint provenance, and the frozen decision under `outputs/day13/`. The second adds `test_baseline_predictions.csv`, `test_final_predictions.csv`, their metrics and confusion matrices, test comparisons, `test_summary.json`, and `evaluation_summary.md`. Existing run directories remain untouched. The selection rule is a strict improvement in seven-class validation macro F1; a tie retains Day 11. Test results cannot revise this choice.
+
 Fine-tuning and learning-rate decay are tested together in this stage. Their individual contributions are not isolated.
 
 ## Fair Comparison Rules
