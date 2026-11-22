@@ -82,32 +82,84 @@ def make_image_dataset(
     architecture: str | None = None,
     augment: Callable[[tf.Tensor], tf.Tensor] | None = None,
     seed: int = SEED,
+    sampled_indices_by_epoch: list[np.ndarray] | None = None,
 ) -> tf.data.Dataset:
     """Keep CSV row order for evaluation; shuffle and augment training rows only."""
     if batch_size < 1 or frame.empty:
         raise ValueError("Use a positive batch size and a nonempty split.")
     if augment is not None and not training:
         raise ValueError("Augmentation is permitted only when training=True.")
+    if sampled_indices_by_epoch is not None and (not training or augment is not None):
+        raise ValueError("Sampled epochs require unaugmented training data.")
     paths = frame["image_path"].astype(str).to_numpy()
     labels = frame["class_index"].astype("int64").to_numpy()
-    dataset = tf.data.Dataset.from_tensor_slices((paths, labels))
-    if training:
-        dataset = dataset.shuffle(len(frame), seed=seed, reshuffle_each_iteration=True)
-    dataset = dataset.map(decode_resize, num_parallel_calls=tf.data.AUTOTUNE)
-    if augment is not None:
-        # Stateful random layers run in dataset order for repeatable seeded runs.
-        dataset = dataset.map(
-            lambda image, label: (tf.ensure_shape(augment(image, training=True), (224, 224, 3)), label),
-            num_parallel_calls=1,
-        )
-    if architecture is not None:
-        preprocess = preprocess_for(architecture)
-        dataset = dataset.map(lambda image, label: (preprocess(image), label), num_parallel_calls=tf.data.AUTOTUNE)
-    if not training:
-        options = tf.data.Options()
-        options.deterministic = True
-        dataset = dataset.with_options(options)
-    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    def finish_epoch(dataset: tf.data.Dataset) -> tf.data.Dataset:
+        dataset = dataset.map(decode_resize, num_parallel_calls=tf.data.AUTOTUNE)
+        if augment is not None:
+            dataset = dataset.map(
+                lambda image, label: (tf.ensure_shape(augment(image, training=True), (224, 224, 3)), label),
+                num_parallel_calls=1,
+            )
+        if architecture is not None:
+            preprocess = preprocess_for(architecture)
+            dataset = dataset.map(lambda image, label: (preprocess(image), label),
+                                  num_parallel_calls=tf.data.AUTOTUNE)
+        if not training:
+            options = tf.data.Options()
+            options.deterministic = True
+            dataset = dataset.with_options(options)
+        return dataset.batch(batch_size)
+
+    if sampled_indices_by_epoch is None:
+        dataset = tf.data.Dataset.from_tensor_slices((paths, labels))
+        if training:
+            dataset = dataset.shuffle(len(frame), seed=seed, reshuffle_each_iteration=True)
+        return finish_epoch(dataset).prefetch(tf.data.AUTOTUNE)
+    if not sampled_indices_by_epoch:
+        raise ValueError("At least one sampled epoch is required.")
+    epochs = []
+    for indices in sampled_indices_by_epoch:
+        indices = np.asarray(indices, dtype=np.int64)
+        if indices.shape != (len(frame),) or np.any(indices < 0) or np.any(indices >= len(frame)):
+            raise ValueError("Each sampled epoch must contain valid training-row indices of original epoch length.")
+        epochs.append(finish_epoch(tf.data.Dataset.from_tensor_slices((paths[indices], labels[indices]))))
+    dataset = epochs[0]
+    for epoch in epochs[1:]:
+        dataset = dataset.concatenate(epoch)
+    return dataset.prefetch(tf.data.AUTOTUNE)
+
+
+def moderate_sampling_probabilities(labels: np.ndarray, num_classes: int = NUM_CLASSES) -> np.ndarray:
+    """Return sqrt-count class probabilities from training labels alone."""
+    labels = np.asarray(labels, dtype=np.int64)
+    if labels.ndim != 1 or labels.size == 0 or np.any(labels < 0) or np.any(labels >= num_classes):
+        raise ValueError("Training labels must be one-dimensional mapped class indices.")
+    counts = np.bincount(labels, minlength=num_classes)
+    if np.any(counts == 0):
+        raise ValueError("Every class must occur in the training split.")
+    roots = np.sqrt(counts.astype(np.float64))
+    return roots / roots.sum()
+
+
+def sample_training_indices(labels: np.ndarray, probabilities: np.ndarray,
+                            draws: int, rng: np.random.Generator) -> np.ndarray:
+    """Choose a class, then one of its training rows, with replacement."""
+    labels = np.asarray(labels, dtype=np.int64)
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    if (draws < 1 or probabilities.shape != (NUM_CLASSES,) or
+            not np.isfinite(probabilities).all() or np.any(probabilities < 0) or
+            not np.isclose(probabilities.sum(), 1, atol=1e-12)):
+        raise ValueError("Invalid sampling probabilities or draw count.")
+    class_rows = [np.flatnonzero(labels == index) for index in range(NUM_CLASSES)]
+    if any(len(rows) == 0 for rows in class_rows):
+        raise ValueError("Every mapped class must have training rows.")
+    classes = rng.choice(NUM_CLASSES, size=draws, p=probabilities)
+    sampled = np.empty(draws, dtype=np.int64)
+    for index, rows in enumerate(class_rows):
+        mask = classes == index
+        sampled[mask] = rows[rng.integers(len(rows), size=int(mask.sum()))]
+    return sampled
 
 
 def inspect_batch(train: pd.DataFrame, output_dir: Path, batch_size: int = 32) -> tf.data.Dataset:

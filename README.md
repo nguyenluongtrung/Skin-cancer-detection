@@ -624,6 +624,17 @@ Day 7 changes only the fine-tuning boundary. Day 6's saved layer lists confirm t
 
 The smoke command writes `outputs/day7_preflight.json` after checking parent metrics, checkpoint and split hashes, Day 6's actual boundary, unchanged inference after setting trainability, one disposable update, frozen block6 and BatchNorm state, and save/reload inference. The full command is manual. It writes a unique `outputs/runs/<run_id>/` with `three_way_validation_comparison.csv`, `three_way_per_class_comparison.csv`, the usual validation artifacts and decision, and appends the experiment log. `history.csv` records `learning_rate_used` at each epoch's start; its `learning_rate` column is sampled by the macro-F1 callback before scheduling callbacks at epoch end. The Day 6 history uses the latter convention. Select Day 7 only if its saved full-precision validation macro F1 exceeds Day 6's. Test remains closed.
 
+## Day 8: moderate oversampling
+
+Day 8 reuses the selected Day 6 run as the ordinary-sampling control. Both branches start from the selected Day 4 checkpoint with the same block6, block7, and `top_conv` trainability, Dense head, optimizer, preprocessing, callback order, and maximum 15 epochs. Only Day 8's training sampling changes: choose class `c` with probability `sqrt(n_c) / sum_j sqrt(n_j)` from training image counts, then choose one of that class's training images uniformly with replacement. The validation split retains its natural frequencies and fixed order. Each oversampled epoch draws exactly 7,153 images in 224 batches of size 32 except the last batch of 17, matching an ordinary epoch's optimizer-update budget. Training loss and accuracy reflect each branch's own sampling distribution and should not be directly compared.
+
+```powershell
+.venv\Scripts\python.exe -m src.train --moderate-oversampling --smoke --config configs/efficientnetb0_moderate_oversampling.json
+.venv\Scripts\python.exe -m src.train --moderate-oversampling --run --config configs/efficientnetb0_moderate_oversampling.json
+```
+
+The smoke command writes `outputs/day8_preflight.json` and `outputs/day8_sampling_probabilities.csv`. It checks the control, parent hash and validation metrics, split hashes, sampling frequencies, epoch batch budget, identical initial weights and trainability, and callback order. The full command is manual. It creates a unique `outputs/runs/<run_id>/` with `sampling_probabilities.csv`, `sampled_class_exposures_by_epoch.csv`, `sampling_validation_comparison.csv`, `sampling_per_class_comparison.csv`, `history.csv`, `metrics.json`, `decision.json`, `validation_predictions.csv`, the best checkpoint, confusion matrices, and plots; it appends `outputs/experiment_log.csv`. Adopt the oversampled checkpoint only if its full-precision validation macro F1 exceeds Day 6's 0.6266277351856852. Test remains closed.
+
 | Model                | Test accuracy | Test macro F1 | Test balanced accuracy |
 | -------------------- | ------------: | ------------: | ---------------------: |
 | Baseline             |       Pending |       Pending |                Pending |
