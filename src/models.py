@@ -130,8 +130,8 @@ def parameter_counts(model: tf.keras.Model) -> dict[str, int]:
 
 def unfreeze_efficientnet_upper_stages(model: tf.keras.Model, *, first_block: int = 6) -> dict:
     """Train the selected upper stages and top conv, keeping BN frozen."""
-    if first_block not in (6, 7):
-        raise ValueError("EfficientNet fine-tuning must start at block6 or block7.")
+    if first_block not in (0, 6, 7):
+        raise ValueError("EfficientNet fine-tuning must use all non-BN layers or start at block6 or block7.")
     backbone = model.get_layer("efficientnetb0")
     names = [layer.name for layer in backbone.layers]
     for prefix in ("block6", "block7"):
@@ -143,7 +143,7 @@ def unfreeze_efficientnet_upper_stages(model: tf.keras.Model, *, first_block: in
     prefixes = tuple(f"block{number}" for number in range(first_block, 8))
     for layer in backbone.layers:
         layer.trainable = (
-            (layer.name.startswith(prefixes) or layer.name == "top_conv")
+            (first_block == 0 or layer.name.startswith(prefixes) or layer.name == "top_conv")
             and not isinstance(layer, tf.keras.layers.BatchNormalization)
         )
     for head_name in ("dense_128", "class_probabilities"):
@@ -153,13 +153,23 @@ def unfreeze_efficientnet_upper_stages(model: tf.keras.Model, *, first_block: in
     if not trainable or any(isinstance(layer, tf.keras.layers.BatchNormalization) and layer.trainable
                             for layer in backbone.layers):
         raise AssertionError("Upper-stage trainability boundary is invalid.")
+    if first_block == 0 and any(any(weight is variable for variable in model.trainable_weights)
+                                for layer in backbone.layers if isinstance(layer, tf.keras.layers.BatchNormalization)
+                                for weight in layer.weights):
+        raise AssertionError("A backbone BatchNormalization variable is trainable.")
     return {
-        "boundary": ", ".join((*[f"block{number}*" for number in range(first_block, 8)],
-                                  "top_conv; all BatchNormalization frozen")),
+        "boundary": ("all non-BatchNormalization backbone layers; all backbone BatchNormalization frozen"
+                     if first_block == 0 else ", ".join((*[f"block{number}*" for number in range(first_block, 8)],
+                                                         "top_conv; all BatchNormalization frozen"))),
         "first_trainable_block": first_block,
         "backbone_trainable_layers": trainable,
         "backbone_frozen_layers": frozen,
+        "backbone_trainable_variables": [weight.path for weight in backbone.trainable_weights],
+        "backbone_frozen_variables": [weight.path for weight in backbone.non_trainable_weights],
+        "model_trainable_variables": [weight.path for weight in model.trainable_weights],
+        "model_non_trainable_variables": [weight.path for weight in model.non_trainable_weights],
         "backbone_trainable_parameters": sum(int(tf.size(weight)) for weight in backbone.trainable_weights),
         "backbone_frozen_parameters": sum(int(tf.size(weight)) for weight in backbone.non_trainable_weights),
         **parameter_counts(model),
+        "non_trainable_parameters": sum(int(tf.size(weight)) for weight in model.non_trainable_weights),
     }
