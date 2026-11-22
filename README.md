@@ -613,6 +613,17 @@ Run the audit and disposable update check, then explicitly start the full experi
 
 The smoke command writes `outputs/day6_preflight.json` with the audit and exact layer lists and parameter counts. The full command creates a unique `outputs/runs/<run_id>/` with the resolved config, parent and split hashes, trainability lists, best checkpoint, epoch history, validation predictions, per-class comparison, confusion matrices, learning curves, metrics, and a keep/reject decision. It appends `outputs/experiment_log.csv`. The frozen checkpoint remains available regardless of the decision. Logged total loss includes the hidden-layer L2 term. Only validation is evaluated; test remains closed.
 
+## Day 7: shallower EfficientNetB0 fine-tuning
+
+Day 7 changes only the fine-tuning boundary. Day 6's saved layer lists confirm trainable `block6*`, `block7*`, and `top_conv`, with every backbone BatchNormalization layer frozen. Day 7 freezes block6 as well, training only `block7*`, `top_conv`, and the existing Dense head. It restarts from the same selected Day 4 checkpoint and uses the Day 6 seed, data order, 15-epoch ceiling, Adam settings, validation macro-F1 callbacks, and hidden-layer L2. The backbone call still uses `training=False`.
+
+```powershell
+.venv\Scripts\python.exe -m src.train --fine-tune-depth --smoke --config configs/efficientnetb0_shallow_fine_tune.json
+.venv\Scripts\python.exe -m src.train --fine-tune-depth --run --config configs/efficientnetb0_shallow_fine_tune.json
+```
+
+The smoke command writes `outputs/day7_preflight.json` after checking parent metrics, checkpoint and split hashes, Day 6's actual boundary, unchanged inference after setting trainability, one disposable update, frozen block6 and BatchNorm state, and save/reload inference. The full command is manual. It writes a unique `outputs/runs/<run_id>/` with `three_way_validation_comparison.csv`, `three_way_per_class_comparison.csv`, the usual validation artifacts and decision, and appends the experiment log. `history.csv` records `learning_rate_used` at each epoch's start; its `learning_rate` column is sampled by the macro-F1 callback before scheduling callbacks at epoch end. The Day 6 history uses the latter convention. Select Day 7 only if its saved full-precision validation macro F1 exceeds Day 6's. Test remains closed.
+
 | Model                | Test accuracy | Test macro F1 | Test balanced accuracy |
 | -------------------- | ------------: | ------------: | ---------------------: |
 | Baseline             |       Pending |       Pending |                Pending |
