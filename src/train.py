@@ -36,7 +36,7 @@ HEAD_EXPERIMENT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "froz
 OPTIMIZER_COMPARISON_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "frozen_optimizer_comparison.json"
 FINE_TUNE_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "efficientnetb0_partial_fine_tune.json"
 BROADER_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "efficientnetb0_broader_fine_tune.json"
-DAY12_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "efficientnetb0_higher_initial_lr.json"
+HIGHER_INITIAL_LR_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "efficientnetb0_higher_initial_lr.json"
 DEPTH_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "efficientnetb0_shallow_fine_tune.json"
 OVERSAMPLING_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "efficientnetb0_moderate_oversampling.json"
 MILD_AUGMENTATION_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "efficientnetb0_mild_augmentation.json"
@@ -1627,7 +1627,7 @@ def main() -> None:
         config_path = ((MILD_AUGMENTATION_CONFIG if args.mild_augmentation else
                         OVERSAMPLING_CONFIG if args.moderate_oversampling else
                         DEPTH_CONFIG if args.fine_tune_depth else
-                        DAY12_CONFIG if args.higher_initial_lr else
+                        HIGHER_INITIAL_LR_CONFIG if args.higher_initial_lr else
                         BROADER_CONFIG if args.broader_fine_tune else FINE_TUNE_CONFIG)
                        if args.config == DEFAULT_CONFIG else args.config)
         config = (load_mild_augmentation_config(config_path, args.outputs_dir) if args.mild_augmentation
